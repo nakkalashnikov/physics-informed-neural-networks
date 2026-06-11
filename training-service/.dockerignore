@@ -1,0 +1,7 @@
+checkpoints/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.egg-info/
+.git/

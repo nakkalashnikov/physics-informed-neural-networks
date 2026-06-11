@@ -1,0 +1,5 @@
+# torch is pre-installed in the base Docker image.
+numpy>=1.26
+fastapi>=0.111
+uvicorn[standard]>=0.29
+pydantic>=2.7

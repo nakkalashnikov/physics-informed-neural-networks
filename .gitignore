@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# Checkpoints & training artefacts — generated, not source
+training-service/checkpoints/*.pt
+training-service/checkpoints/history.json
+training-service/*.log
+training-service/inspect_output.png
+
+# macOS
+.DS_Store
+
+# Node / Next.js
+ui/node_modules/
+ui/.next/
+ui/.env.local
+
