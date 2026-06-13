@@ -19,6 +19,8 @@ validation error from 186% → 289% in the original run.
 import os
 import json
 import logging
+import threading
+import queue
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -31,6 +33,39 @@ log = logging.getLogger(__name__)
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
+
+class _BatchPrefetcher:
+    """
+    Generates batches in a background thread so CPU sampling is overlapped
+    with GPU compute. The queue holds ready-made batches — the main loop
+    just calls .get() with zero wait.
+
+    Memory cost: queue_size × ~2 MB per batch (negligible on 16+ GB VRAM).
+    """
+
+    def __init__(self, cfg: dict, normalizer, device: torch.device, queue_size: int = 4):
+        self._cfg       = cfg
+        self._norm      = normalizer
+        self._device    = device
+        self._queue     = queue.Queue(maxsize=queue_size)
+        self._stop      = threading.Event()
+        self._thread    = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                batch = build_batch(self._cfg, self._norm, self._device)
+                self._queue.put(batch)
+            except Exception:
+                pass  # keep running even on transient errors
+
+    def get(self) -> tuple:
+        return self._queue.get()
+
+    def stop(self) -> None:
+        self._stop.set()
+
 
 def _cast_batch(batch: tuple, dtype: torch.dtype) -> tuple:
     """Recursively cast all tensors in a batch tuple to the given dtype."""
@@ -209,7 +244,11 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
                  start_step, optimizer.param_groups[0]["lr"])
 
     model.train()
-    remaining = t_cfg["adam_steps"] - start_step
+    use_prefetch = bool(cfg.get("use_prefetch", True)) and device.type == "cuda"
+    prefetcher   = _BatchPrefetcher(cfg, normalizer, device) if use_prefetch else None
+    if use_prefetch:
+        log.info("Async batch prefetcher enabled (queue_size=4)")
+
     pbar = tqdm(range(start_step, t_cfg["adam_steps"]), desc="Adam", dynamic_ncols=True)
 
     for step in pbar:
@@ -222,7 +261,14 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
         if use_rad and step % rad_update_every == 0:
             rad_cache = rad_resample_pde(model, cfg, normalizer, device)
 
-        batch = build_batch(cfg, normalizer, device, pde_override=rad_cache)
+        # Get pre-built batch from prefetcher (or build inline as fallback).
+        # When RAD is active, replace only the PDE tuple — BC/IC come from prefetch.
+        if prefetcher is not None:
+            _raw = prefetcher.get()
+            batch = (_raw[0] if rad_cache is None else rad_cache, _raw[1], _raw[2])
+        else:
+            batch = build_batch(cfg, normalizer, device, pde_override=rad_cache)
+
         if use_fp64:
             batch = _cast_batch(batch, dtype)
 
@@ -283,6 +329,9 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
         if step > 0 and step % t_cfg["validate_every"] == 0:
             err = validate(model, normalizer, cfg, device)
             history["val"].append([step, err])
+
+    if prefetcher is not None:
+        prefetcher.stop()
 
     # ── Final save ────────────────────────────────────────────────────────────
     final_err = validate(model, normalizer, cfg, device)

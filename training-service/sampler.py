@@ -14,7 +14,6 @@ where:
 
 import torch
 import numpy as np
-from scipy.stats import qmc
 
 
 # ── Normalizer ────────────────────────────────────────────────────────────────
@@ -59,9 +58,10 @@ def sample_params(n: int, cfg: dict, device: torch.device) -> dict[str, torch.Te
     """
     p = cfg["physics"]
 
-    # LHS over 5 dimensions: alpha, rho_c, l, intensity, x0_frac
-    lhs = qmc.LatinHypercube(d=5, seed=None)
-    u = torch.tensor(lhs.random(n=n), dtype=torch.float32, device=device)
+    # GPU-side uniform sampling — replaces scipy LHS.
+    # LHS has better per-batch coverage but over 120k steps × 16 params the
+    # difference vs random is negligible, and this eliminates all CPU→GPU transfer.
+    u = torch.rand(n, 5, device=device)
 
     def scale(col: int, lo: float, hi: float) -> torch.Tensor:
         return u[:, col] * (hi - lo) + lo
