@@ -13,6 +13,9 @@ training-service/inspect_output.png
 # macOS
 .DS_Store
 
+# IDE tooling
+.codegraph/
+
 # Node / Next.js
 ui/node_modules/
 ui/.next/
