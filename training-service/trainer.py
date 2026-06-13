@@ -179,8 +179,12 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
     scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     if cfg.get("use_compile", False) and hasattr(torch, "compile"):
-        model = torch.compile(model, mode="reduce-overhead")
-        log.info("torch.compile enabled (mode=reduce-overhead)")
+        # mode="default": kernel/operator fusion without CUDA Graphs.
+        # "reduce-overhead" (CUDA Graphs) conflicts with create_graph=True in pde_loss
+        # (donated-buffer aliasing) and with multiple model() calls in pde_residuals_fd
+        # (output buffer overwrite). Both issues disappear with mode="default".
+        model = torch.compile(model, mode="default")
+        log.info("torch.compile enabled (mode=default, no CUDA Graphs)")
 
     start_step = 0
     if resume:
