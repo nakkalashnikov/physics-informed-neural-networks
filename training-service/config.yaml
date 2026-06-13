@@ -93,4 +93,4 @@ seed:   42
 # Reduces floating-point accumulation errors in gradient computation.
 # Effect is smaller for Adam than for L-BFGS (~10-20% error reduction).
 # Slows training ~1.5x and doubles VRAM usage.
-use_fp64: false
+use_fp64: true
