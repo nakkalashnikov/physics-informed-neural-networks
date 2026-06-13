@@ -140,6 +140,9 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
         model = model.double()
         log.info("FP64 mode enabled (double precision)")
 
+    use_amp = bool(cfg.get("use_amp", False)) and device.type == "cuda" and not use_fp64
+    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     start_step = 0
     if resume:
         ckpt = torch.load(resume, map_location=device)
@@ -179,8 +182,9 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
     log.info("=" * 60)
     log.info("Adam  (%d steps)  |  sigma %.1f → %.1f  |  causal ε=%.1f",
              t_cfg["adam_steps"], sigma_start, sigma_end, causal_epsilon)
-    log.info("Hard IC: on   |   FP64: %s  |   RAD: %s",
+    log.info("Hard IC: on   |   FP64: %s  |   AMP: %s  |   RAD: %s",
              "on" if use_fp64 else "off",
+             "on" if use_amp else "off",
              f"on (every {rad_update_every} steps)" if use_rad else "off")
     log.info("=" * 60)
 
@@ -219,18 +223,22 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
             batch = _cast_batch(batch, dtype)
 
         optimizer.zero_grad()
-        loss, l_pde, l_bc, l_ic = total_loss(
-            model, batch, weights,
-            epsilon=causal_epsilon,
-            n_bins=causal_n_bins,
-        )
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            loss, l_pde, l_bc, l_ic = total_loss(
+                model, batch, weights,
+                epsilon=causal_epsilon,
+                n_bins=causal_n_bins,
+            )
 
         if not torch.isfinite(loss):
             log.warning("Step %d: non-finite loss (%.3e) — skipping", step, loss.item())
+            if use_amp:
+                scaler.update()
             scheduler.step()
             continue
 
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
 
         grads_ok = all(
             p.grad is None or torch.isfinite(p.grad).all()
@@ -239,11 +247,14 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
         if not grads_ok:
             log.warning("Step %d: NaN/Inf gradient — skipping", step)
             optimizer.zero_grad()
+            if use_amp:
+                scaler.update()
             scheduler.step()
             continue
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), t_cfg["grad_clip_norm"])
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
 
         if step % t_cfg["log_every"] == 0:

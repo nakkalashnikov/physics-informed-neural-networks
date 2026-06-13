@@ -93,4 +93,10 @@ seed:   42
 # Reduces floating-point accumulation errors in gradient computation.
 # Effect is smaller for Adam than for L-BFGS (~10-20% error reduction).
 # Slows training ~1.5x and doubles VRAM usage.
-use_fp64: true
+use_fp64: false
+
+# AMP — Automatic Mixed Precision (forward in FP16, gradients in FP32).
+# Gives 1.5-2.5x speedup on consumer GPUs with tensor cores (RTX series).
+# Pure FP16 is unsafe for PINNs; AMP keeps gradient accumulation in FP32.
+# Only works on CUDA; ignored on CPU/MPS.
+use_amp: true
