@@ -97,7 +97,7 @@ use_fp64: false
 
 # torch.compile — fuses CUDA kernels, reduces CPU launch overhead (~20-40% speedup).
 # mode="reduce-overhead" uses CUDA Graphs internally for repeated kernel patterns.
-use_compile: true
+use_compile: false
 
 # AMP — Automatic Mixed Precision (forward in FP16, gradients in FP32).
 # Gives 1.5-2.5x speedup on consumer GPUs with tensor cores (RTX series).
