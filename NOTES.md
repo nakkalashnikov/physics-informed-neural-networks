@@ -34,7 +34,7 @@ training-service/
   model.py          — архітектура: FourierFeatures + PirateNet blocks + hard IC (вхід: 3 π-групи)
   physics.py        — pde_loss/bc_loss/ic_loss (безрозмірні), pde_residuals_fd, analytical_delta_T
   sampler.py        — sample_params, compute_pi_groups (знерозмірення), build_batch, rad_resample_pde
-  trainer.py        — цикл навчання: Adam + cosine LR + AMP + RAD + валідація
+  trainer.py        — цикл навчання: Adam + cosine LR + RAD + валідація + async prefetcher
   inspect_model.py  — завантажує checkpoint, малює графіки порівняння з аналітикою
 
 inference-service/  — FastAPI: приймає параметри, повертає ΔT(x,t) через модель
@@ -265,7 +265,14 @@ scaler.update()                            # адаптує scale factor
 **NaN на перших ~15 кроках — нормально:** GradScaler стартує з великим scale,
 виявляє overflow, ділить scale вдвічі, повторює. Після стабілізації NaN зникають.
 
-**Параметр:** `use_amp: true` (автоматично вимикається якщо `use_fp64: true` або device ≠ cuda)
+**Поточний статус: вимкнено (`use_amp: false`).**
+Нова безрозмірна постановка має джерело S з піком ≈ 19.95. Gradient через різкий Gaussian
+(σ*=1/50) переповнює FP16 → GradScaler не може знайти стабільний scale → кожен крок NaN →
+ваги заморожуються назавжди. Тренування просувалось по кроках, але жодного оновлення ваг
+не відбувалось (~2000 steps = нуль навчання). AMP може повернутись якщо збільшити σ* або
+перейти на серверний GPU із ширшим FP16-діапазоном.
+
+**Параметр:** `use_amp: false`
 
 ---
 
@@ -281,6 +288,69 @@ scaler.update()                            # адаптує scale factor
 ETA = 19 годин замість 2. На серверних GPU (A100: 1:2) FP64 виправданий.
 
 **Параметр:** `use_fp64: false` — не вмикати на consumer GPU.
+
+---
+
+### 6. torch.compile (реалізовано, вимкнено)
+
+**Ідея:** `torch.compile` аналізує граф обчислень і зливає CUDA-ядра у більші блоки,
+зменшуючи overhead на запуск кожного ядра. Обіцяний speedup ~20-40%.
+
+**Чому вимкнено — несумісність з `create_graph=True`:**
+
+`torch.compile` (будь-який mode) використовує **AOT Autograd** (Ahead-of-Time), який компілює
+backward з "donated buffers" — оптимізація де буфери входу backward передаються як буфери
+виходу (memory aliasing). `pde_loss` викликає backward через скомпільовану модель з
+`create_graph=True` (потрібно для ∂²u/∂x*² — grad of grad). AOT Autograd підіймає:
+```
+RuntimeError: This backward function was compiled with non-empty donated buffers
+which requires create_graph=False and retain_graph=False.
+```
+Це фундаментальна несумісність у поточній версії PyTorch: donated buffers + create_graph=True
+не можуть існувати разом. Правильний PyTorch 2.x fix — переписати `pde_loss` через
+`torch.func.grad` + `torch.func.vmap` (functional transforms, compile-compatible), але це
+серйозний рефакторинг. Зміна режиму (`mode="default"` замість `"reduce-overhead"`) не допомогла —
+donated buffers є в усіх режимах compile.
+
+**Додатковий конфлікт (CUDA Graphs у `reduce-overhead`):**
+`mode="reduce-overhead"` додатково використовує CUDA Graphs, які фіксують один вхідний буфер.
+При 4 різних викликах моделі в `pde_residuals_fd` (RAD) кожен наступний перезаписує буфер
+попереднього. Зафіксовано через `.clone()` після кожного `model()` виклику.
+
+**Параметр:** `use_compile: false`
+
+---
+
+### 7. Async Batch Prefetcher
+
+**Проблема:** на RTX 5090 і RTX 5060 Ti однакова швидкість (~18 it/s). Причина — CPU
+bottleneck: scipy LHS + Python-цикл генерації батча займали ~50 мс, GPU чекав.
+
+**Рішення — два кроки:**
+
+1. **scipy → `torch.rand`**: семплювання параметрів перенесено на GPU. LHS давав кращий
+   per-batch coverage, але за 120k кроків різниця з random ≈ 0, а CPU↔GPU трансфер зник.
+
+2. **`_BatchPrefetcher`** — фоновий thread генерує батчі, поки GPU рахує поточний крок:
+```python
+class _BatchPrefetcher:
+    def __init__(self, cfg, normalizer, device, queue_size=4):
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        while not self._stop.is_set():
+            self._queue.put(build_batch(self._cfg, self._norm, self._device))
+
+    def get(self): return self._queue.get()  # main loop: нуль чекання
+```
+Main loop робить `prefetcher.get()` — бере готовий батч без затримки.
+Коли RAD активний: PDE-точки замінюються на `rad_cache`, BC/IC беруться з prefetcher.
+
+**Результат:** 18.6 it/s → **26+ it/s** на RTX 5070 Ti (разом з усуненням scipy).
+
+**Параметр:** `use_prefetch: true` (вмикається автоматично на CUDA, вимикається на CPU/MPS)
 
 ---
 
@@ -312,11 +382,13 @@ for _ in range(start_step):
 | 2 | PirateNets (неповні, без U/V) | + | 50 000 | 84% |
 | 3 | PirateNets (повні) | + | 60 000 | **68%** |
 | 4 | PirateNets (повні) | + RAD + AMP | — | впирається в ~68% (масштаб) |
-| 5 | PirateNets + **знерозмірення (3 π-групи)** | + RAD + AMP | *тренується* | очікуємо однозначні % |
+| 5a | PirateNets + знерозмірення | + RAD + AMP | — | NaN death spiral (AMP + гострий Gaussian) |
+| 5b | PirateNets + знерозмірення | + RAD, без AMP | *тренується* | очікуємо однозначні % |
 
 Запуск #3 деградував після 60k через баг з LR resume (стартував з 4.4e-4 замість 2.55e-4).
 Запуски #1–4 усі впиралися в стелю масштабу (ΔT охоплює ~3 порядки → loss ігнорує тихі набори).
-Запуск #5 — перший зі знерозміреною задачею; це структурне виправлення, а не тюнінг.
+Запуск #5a: знерозмірення + AMP → GradScaler завис на NaN, ваги не оновлювались 2000+ кроків.
+Запуск #5b: те саме без AMP → стабільно, ~16-18 it/s, це поточний ран.
 
 ---
 
@@ -335,10 +407,11 @@ relative L2 error = ||ΔT_PINN − ΔT_analytical|| / ||ΔT_analytical||
 ## Реалістичний прогноз
 
 ```
-Baseline (MLP):               76%
-Запуск 3 (PirateNets):        68%   ← стеля масштабу
-Запуск 4 (+ RAD + AMP):       ~68%  ← та сама стеля (масштаб не виправлений)
-Запуск 5 (+ знерозмірення):   ???   ← очікуємо однозначні % (стеля знята)
+Baseline (MLP):                      76%
+Запуск 3 (PirateNets):               68%   ← стеля масштабу
+Запуск 4 (+ RAD + AMP):              ~68%  ← та сама стеля (масштаб не виправлений)
+Запуск 5a (+ знерозмірення + AMP):   FAIL  ← NaN death spiral
+Запуск 5b (+ знерозмірення, без AMP): ???  ← ЗАРАЗ, очікуємо однозначні %
 ```
 
 **5% без аналітичної формули.** Раніше це здавалось дуже амбіційним для параметричного PINN.
