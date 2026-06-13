@@ -42,6 +42,7 @@ def main() -> None:
     torch.manual_seed(seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
+        torch.set_float32_matmul_precision("high")  # enables TF32 on Ampere+
 
     from trainer import train
     train(cfg, device, resume=args.resume)

@@ -186,6 +186,10 @@ def pde_residuals_fd(
 
     Returns: (N,) tensor of |residual| values.
     """
+    # When torch.compile uses CUDA Graphs, multiple model calls with different
+    # inputs require marking each as a new graph step to avoid buffer overwrites.
+    _mark = getattr(torch.compiler, "cudagraph_mark_step_begin", lambda: None)
+
     with torch.no_grad():
         l       = raw["l"].unsqueeze(1)
         t_total = raw["t_total"].unsqueeze(1)
@@ -194,15 +198,14 @@ def pde_residuals_fd(
         x0      = raw["x0"].unsqueeze(1)
         v       = raw["v"].unsqueeze(1)
 
-        dT_c = model(coords_norm, params_norm)
-
         c_xp = coords_norm.clone(); c_xp[:, 0] = (c_xp[:, 0] + eps_x).clamp(0.0, 1.0)
         c_xm = coords_norm.clone(); c_xm[:, 0] = (c_xm[:, 0] - eps_x).clamp(0.0, 1.0)
         c_tp = coords_norm.clone(); c_tp[:, 1] = (c_tp[:, 1] + eps_t).clamp(0.0, 1.0)
 
-        dT_xp = model(c_xp, params_norm)
-        dT_xm = model(c_xm, params_norm)
-        dT_tp = model(c_tp, params_norm)
+        _mark(); dT_c  = model(coords_norm, params_norm)
+        _mark(); dT_xp = model(c_xp, params_norm)
+        _mark(); dT_xm = model(c_xm, params_norm)
+        _mark(); dT_tp = model(c_tp, params_norm)
 
         dT_dxx_n = (dT_xp - 2.0 * dT_c + dT_xm) / (eps_x ** 2)   # ∂²/∂x_norm²
         dT_dt_n  = (dT_tp - dT_c) / eps_t                          # ∂/∂t_norm
