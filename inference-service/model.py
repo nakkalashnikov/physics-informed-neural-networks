@@ -14,6 +14,12 @@ guarantees ΔT(x, 0) = 0 for all inputs without a soft penalty term.
 Fourier sigma is annealed during training via set_sigma(): the network
 starts learning smooth global structure (low σ) and gradually gains access
 to higher frequencies needed to capture the narrow moving heat source.
+
+Hidden layers use the PirateNet residual block (Wang et al., JMLR 2024):
+    H_next = (1 − α) · H  +  α · tanh(W · H + b)
+where α is a learnable scalar initialised to 0.  At the start of training
+all blocks act as identity maps (shallow network); α grows during training
+to progressively unlock depth as needed.
 """
 
 import math
@@ -47,9 +53,32 @@ class FourierFeatures(nn.Module):
         return torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)
 
 
+class PirateBlock(nn.Module):
+    """
+    PirateNet residual block (Wang et al., JMLR 2024).
+
+    H_next = (1 − α) · H  +  α · tanh(W · H + b)
+
+    α is a learnable scalar per block, initialised to 0.
+    At α=0 the block is an identity map; as α grows the block becomes
+    a standard tanh layer.  This lets the network start shallow and
+    progressively unlock depth during training.
+    """
+
+    def __init__(self, size: int):
+        super().__init__()
+        self.linear = nn.Linear(size, size)
+        self.alpha  = nn.Parameter(torch.zeros(1))   # gate: 0 = identity
+        nn.init.xavier_uniform_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (1.0 - self.alpha) * x + self.alpha * torch.tanh(self.linear(x))
+
+
 class PINN(nn.Module):
     """
-    Parameterised Physics-Informed Neural Network.
+    Parameterised Physics-Informed Neural Network with PirateNet hidden layers.
 
     Input layout
     ─────────────
@@ -60,7 +89,7 @@ class PINN(nn.Module):
     ──────
     delta_T : (N, 1)  –  ΔT = T − T_amb  [K]
 
-    Hard IC: output = t_norm * MLP(features), so ΔT(x, 0) ≡ 0.
+    Hard IC: output = t_norm * net(features), so ΔT(x, 0) ≡ 0.
     """
 
     def __init__(
@@ -77,19 +106,20 @@ class PINN(nn.Module):
         # 128 Fourier features + 5 normalised physics parameters
         d_in_mlp = self.fourier.out_dim + 5
 
-        layers: list[nn.Module] = [nn.Linear(d_in_mlp, hidden_size), nn.Tanh()]
-        for _ in range(hidden_layers - 1):
-            layers += [nn.Linear(hidden_size, hidden_size), nn.Tanh()]
-        layers.append(nn.Linear(hidden_size, 1))
+        # Input projection: plain linear + tanh (no gate needed here)
+        self.input_layer = nn.Linear(d_in_mlp, hidden_size)
+        nn.init.xavier_uniform_(self.input_layer.weight)
+        nn.init.zeros_(self.input_layer.bias)
 
-        self.mlp = nn.Sequential(*layers)
-        self._init_weights()
+        # PirateNet residual blocks (one fewer than hidden_layers)
+        self.blocks = nn.ModuleList([
+            PirateBlock(hidden_size) for _ in range(hidden_layers - 1)
+        ])
 
-    def _init_weights(self) -> None:
-        for layer in self.mlp:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.zeros_(layer.bias)
+        # Output projection
+        self.output_layer = nn.Linear(hidden_size, 1)
+        nn.init.xavier_uniform_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
 
     def set_sigma(self, sigma: float) -> None:
         """Update Fourier bandwidth. Call once per training step."""
@@ -103,7 +133,12 @@ class PINN(nn.Module):
         encoded  = self.fourier(coords_norm)                        # (N, 128)
         features = torch.cat([encoded, params_norm], dim=-1)        # (N, 133)
         t_norm   = coords_norm[:, 1:2]                              # (N,   1)
-        return t_norm * self.mlp(features)                          # hard IC
+
+        h = torch.tanh(self.input_layer(features))                  # (N, 256)
+        for block in self.blocks:
+            h = block(h)                                            # (N, 256)
+
+        return t_norm * self.output_layer(h)                        # hard IC
 
 
 def build_model(cfg: dict) -> PINN:
