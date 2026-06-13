@@ -25,12 +25,25 @@ from tqdm import tqdm
 
 from model import PINN, build_model
 from physics import total_loss, analytical_delta_T
-from sampler import Normalizer, build_batch, sample_params
+from sampler import Normalizer, build_batch, sample_params, rad_resample_pde
 
 log = logging.getLogger(__name__)
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
+
+def _cast_batch(batch: tuple, dtype: torch.dtype) -> tuple:
+    """Recursively cast all tensors in a batch tuple to the given dtype."""
+    def _cast(x):
+        if isinstance(x, torch.Tensor):
+            return x.to(dtype)
+        if isinstance(x, dict):
+            return {k: _cast(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return type(x)(_cast(v) for v in x)
+        return x
+    return _cast(batch)
+
 
 def validate(
     model: PINN,
@@ -44,6 +57,7 @@ def validate(
     averaged over n_test random parameter sets.
     """
     model.eval()
+    dtype = next(model.parameters()).dtype
     raw = sample_params(n_test, cfg, device)
     x_pts_norm = np.linspace(0.0, 1.0, 100)
     errors: list[float] = []
@@ -60,16 +74,16 @@ def validate(
             i_eff  = raw["i_eff"][k].item()
 
             t_q    = t_tot * 0.7
-            t_norm = torch.full((100,), t_q / t_tot, device=device)
-            x_norm = torch.tensor(x_pts_norm, dtype=torch.float32, device=device)
+            t_norm = torch.full((100,), t_q / t_tot, device=device, dtype=dtype)
+            x_norm = torch.tensor(x_pts_norm, dtype=dtype, device=device)
             coords = torch.stack([x_norm, t_norm], dim=1)
 
             n = 100
-            alpha_n  = normalizer.norm(torch.full((n,), alpha,  device=device), "alpha")
-            l_n      = normalizer.norm(torch.full((n,), l,      device=device), "l")
-            i_eff_n  = normalizer.norm(torch.full((n,), i_eff,  device=device), "i_eff")
-            x0_n     = torch.full((n,), x0 / l, device=device)
-            v_n      = normalizer.norm(torch.full((n,), v,      device=device), "v")
+            alpha_n  = normalizer.norm(torch.full((n,), alpha,  device=device, dtype=dtype), "alpha")
+            l_n      = normalizer.norm(torch.full((n,), l,      device=device, dtype=dtype), "l")
+            i_eff_n  = normalizer.norm(torch.full((n,), i_eff,  device=device, dtype=dtype), "i_eff")
+            x0_n     = torch.full((n,), x0 / l, device=device, dtype=dtype)
+            v_n      = normalizer.norm(torch.full((n,), v,      device=device, dtype=dtype), "v")
             params   = torch.stack([alpha_n, l_n, i_eff_n, x0_n, v_n], dim=1)
 
             dT_pred = model(coords, params).squeeze().cpu().numpy()
@@ -120,6 +134,12 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
     n_params = sum(p.numel() for p in model.parameters())
     log.info("Model: %d trainable parameters", n_params)
 
+    use_fp64 = bool(cfg.get("use_fp64", False))
+    dtype    = torch.float64 if use_fp64 else torch.float32
+    if use_fp64:
+        model = model.double()
+        log.info("FP64 mode enabled (double precision)")
+
     start_step = 0
     if resume:
         ckpt = torch.load(resume, map_location=device)
@@ -152,10 +172,16 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
         "val": [],  # list of [step, error] pairs
     }
 
+    use_rad          = bool(cfg["sampling"].get("rad_enabled", False))
+    rad_update_every = int(cfg["sampling"].get("rad_update_every", 50))
+    rad_cache: tuple | None = None
+
     log.info("=" * 60)
     log.info("Adam  (%d steps)  |  sigma %.1f → %.1f  |  causal ε=%.1f",
              t_cfg["adam_steps"], sigma_start, sigma_end, causal_epsilon)
-    log.info("Hard IC: on   |   L-BFGS: removed")
+    log.info("Hard IC: on   |   FP64: %s  |   RAD: %s",
+             "on" if use_fp64 else "off",
+             f"on (every {rad_update_every} steps)" if use_rad else "off")
     log.info("=" * 60)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=t_cfg["adam_lr"])
@@ -180,7 +206,12 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
         sigma = sigma_start + (sigma_end - sigma_start) * progress
         model.set_sigma(sigma)
 
-        batch = build_batch(cfg, normalizer, device)
+        if use_rad and step % rad_update_every == 0:
+            rad_cache = rad_resample_pde(model, cfg, normalizer, device)
+
+        batch = build_batch(cfg, normalizer, device, pde_override=rad_cache)
+        if use_fp64:
+            batch = _cast_batch(batch, dtype)
 
         optimizer.zero_grad()
         loss, l_pde, l_bc, l_ic = total_loss(

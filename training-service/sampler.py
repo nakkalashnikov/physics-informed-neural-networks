@@ -123,10 +123,68 @@ def _params_norm_for_set(
     return torch.stack([alpha_n, l_n, i_eff_n, x0_n, v_n], dim=1)
 
 
+def rad_resample_pde(
+    model,
+    cfg: dict,
+    normalizer: Normalizer,
+    device: torch.device,
+) -> tuple:
+    """
+    RAD — Residual-based Adaptive Distribution (arXiv:2207.10289).
+
+    Steps:
+      1. Sample pool_factor × n_pde candidate points uniformly.
+      2. Evaluate |PDE residual| via finite differences (4 forward passes, no_grad).
+      3. Draw n_pde points with probability ∝ |residual| — concentrates near
+         the moving heat source without any manual tuning.
+
+    Returns (coords_pde, params_pde, raw_pde) — same format as build_batch's
+    PDE tuple, so it can be passed directly as pde_override.
+    """
+    from physics import pde_residuals_fd
+
+    s_cfg       = cfg["sampling"]
+    n_p         = s_cfg["n_params_per_step"]
+    n_pde       = s_cfg["n_pde"]
+    pool_factor = int(s_cfg.get("rad_pool_factor", 5))
+    pps_cand    = (n_pde * pool_factor) // n_p   # candidates per param set
+    pps_target  = n_pde // n_p                   # selected per param set
+
+    raw_sets = sample_params(n_p, cfg, device)
+    dtype    = next(model.parameters()).dtype
+
+    coords_out, params_out = [], []
+    raw_acc: dict[str, list[torch.Tensor]] = {k: [] for k in raw_sets}
+
+    model.eval()
+    for k in range(n_p):
+        raw_k = {key: raw_sets[key][k] for key in raw_sets}
+
+        xn = torch.rand(pps_cand, device=device, dtype=dtype)
+        tn = torch.rand(pps_cand, device=device, dtype=dtype)
+        coords_cand = torch.stack([xn, tn], dim=1)
+        params_cand = _params_norm_for_set(raw_k, normalizer, pps_cand).to(dtype)
+        raw_cand    = {key: _to_column(raw_k[key], pps_cand).to(dtype) for key in raw_sets}
+
+        resids = pde_residuals_fd(model, coords_cand, params_cand, raw_cand)  # (pps_cand,)
+        probs  = resids.float() / (resids.float().sum() + 1e-8)
+        idx    = torch.multinomial(probs, pps_target, replacement=False)
+
+        coords_out.append(coords_cand[idx])
+        params_out.append(params_cand[idx])
+        for key in raw_sets:
+            raw_acc[key].append(raw_cand[key][idx])
+
+    model.train()
+    raw_pde = {key: torch.cat(raw_acc[key]) for key in raw_sets}
+    return torch.cat(coords_out), torch.cat(params_out), raw_pde
+
+
 def build_batch(
     cfg: dict,
     normalizer: Normalizer,
     device: torch.device,
+    pde_override: tuple | None = None,
 ) -> tuple:
     """
     Build one full training batch.
@@ -146,47 +204,50 @@ def build_batch(
     coords_*   : (N, 2)  float32  –  [x_norm, t_norm]
     params_*   : (N, 5)  float32  –  normalised physics params
     raw_pde    : dict of (N_pde,) float32 tensors  –  physical values
+
+    pde_override : if provided (from rad_resample_pde), skip PDE point generation
+                   and use these points instead.  BC and IC are always freshly sampled.
     """
     n_p     = cfg["sampling"]["n_params_per_step"]
-    n_pde   = cfg["sampling"]["n_pde"]
     n_bc    = cfg["sampling"]["n_bc"]
     n_ic    = cfg["sampling"]["n_ic"]
-    pps_pde = n_pde // n_p
     pps_bc  = max(n_bc // n_p, 2)
     pps_ic  = max(n_ic // n_p, 2)
 
     raw_sets = sample_params(n_p, cfg, device)   # each value: (n_p,)
 
-    coords_pde, params_pde = [], []
-    coords_bc,  params_bc  = [], []
-    coords_ic,  params_ic  = [], []
-    raw_pde_acc: dict[str, list[torch.Tensor]] = {k: [] for k in raw_sets}
+    coords_bc, params_bc = [], []
+    coords_ic, params_ic = [], []
+
+    if pde_override is None:
+        n_pde   = cfg["sampling"]["n_pde"]
+        pps_pde = n_pde // n_p
+        coords_pde, params_pde = [], []
+        raw_pde_acc: dict[str, list[torch.Tensor]] = {k: [] for k in raw_sets}
 
     for k in range(n_p):
         raw_k = {key: raw_sets[key][k] for key in raw_sets}   # 0-dim tensors
 
-        # ── PDE interior: 70% uniform + 30% near burner trajectory ──────
-        n_unif   = int(pps_pde * 0.70)
-        n_burner = pps_pde - n_unif
+        if pde_override is None:
+            # ── PDE interior: 70% uniform + 30% near burner trajectory ──────
+            n_unif   = int(pps_pde * 0.70)
+            n_burner = pps_pde - n_unif
 
-        xn_unif = torch.rand(n_unif, device=device)
-        tn_unif = torch.rand(n_unif, device=device)
+            xn_unif = torch.rand(n_unif, device=device)
+            tn_unif = torch.rand(n_unif, device=device)
 
-        # Burner points: sample t first, then x near x_b(t)
-        tn_burner = torch.rand(n_burner, device=device)
-        sigma_n = 1.0 / 20.0           # same width as physics.py sigma_g/l
+            tn_burner = torch.rand(n_burner, device=device)
+            sigma_n   = 1.0 / 20.0
+            x_b_norm  = (raw_k["x0"] + raw_k["v"] * tn_burner * raw_k["t_total"]) / raw_k["l"]
+            xn_burner = (x_b_norm + torch.randn(n_burner, device=device) * sigma_n
+                         ).clamp(0.0, 1.0)
 
-        # x_b(t) / l  in normalised coords
-        x_b_norm = (raw_k["x0"] + raw_k["v"] * tn_burner * raw_k["t_total"]) / raw_k["l"]
-        xn_burner = (x_b_norm + torch.randn(n_burner, device=device) * sigma_n
-                     ).clamp(0.0, 1.0)
-
-        xn = torch.cat([xn_unif, xn_burner])
-        tn = torch.cat([tn_unif, tn_burner])
-        coords_pde.append(torch.stack([xn, tn], dim=1))
-        params_pde.append(_params_norm_for_set(raw_k, normalizer, pps_pde))
-        for key in raw_sets:
-            raw_pde_acc[key].append(_to_column(raw_k[key], pps_pde))
+            xn = torch.cat([xn_unif, xn_burner])
+            tn = torch.cat([tn_unif, tn_burner])
+            coords_pde.append(torch.stack([xn, tn], dim=1))
+            params_pde.append(_params_norm_for_set(raw_k, normalizer, pps_pde))
+            for key in raw_sets:
+                raw_pde_acc[key].append(_to_column(raw_k[key], pps_pde))
 
         # ── BC: x_norm ∈ {0, 1} (equal split), t_norm ∈ (0,1) ───────────
         half  = pps_bc // 2
@@ -204,10 +265,14 @@ def build_batch(
         coords_ic.append(torch.stack([x_ic, t_ic], dim=1))
         params_ic.append(_params_norm_for_set(raw_k, normalizer, pps_ic))
 
-    raw_pde = {key: torch.cat(raw_pde_acc[key]) for key in raw_sets}
+    if pde_override is None:
+        raw_pde   = {key: torch.cat(raw_pde_acc[key]) for key in raw_sets}
+        pde_tuple = (torch.cat(coords_pde), torch.cat(params_pde), raw_pde)
+    else:
+        pde_tuple = pde_override
 
     return (
-        (torch.cat(coords_pde), torch.cat(params_pde), raw_pde),
+        pde_tuple,
         (torch.cat(coords_bc),  torch.cat(params_bc)),
         (torch.cat(coords_ic),  torch.cat(params_ic)),
     )

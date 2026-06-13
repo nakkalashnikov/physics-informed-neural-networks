@@ -166,6 +166,60 @@ def bc_loss(
     return torch.stack(losses).mean()
 
 
+def pde_residuals_fd(
+    model: nn.Module,
+    coords_norm: torch.Tensor,   # (N, 2)
+    params_norm: torch.Tensor,   # (N, 5)
+    raw: dict,
+    eps_x: float = 1e-3,
+    eps_t: float = 1e-4,
+) -> torch.Tensor:
+    """
+    Absolute PDE residuals via finite differences — for RAD sampling only.
+
+    Uses 4 forward passes (center, x±ε, t+ε) inside torch.no_grad(), so no
+    computation graph is built. This makes it ~40× cheaper in memory than
+    autograd at the large pool sizes RAD needs (pool_factor × n_pde points).
+
+    Accuracy is sufficient for RAD: we only need to know *where* residuals
+    are large, not their exact values.
+
+    Returns: (N,) tensor of |residual| values.
+    """
+    with torch.no_grad():
+        l       = raw["l"].unsqueeze(1)
+        t_total = raw["t_total"].unsqueeze(1)
+        alpha   = raw["alpha"].unsqueeze(1)
+        i_eff   = raw["i_eff"].unsqueeze(1)
+        x0      = raw["x0"].unsqueeze(1)
+        v       = raw["v"].unsqueeze(1)
+
+        dT_c = model(coords_norm, params_norm)
+
+        c_xp = coords_norm.clone(); c_xp[:, 0] = (c_xp[:, 0] + eps_x).clamp(0.0, 1.0)
+        c_xm = coords_norm.clone(); c_xm[:, 0] = (c_xm[:, 0] - eps_x).clamp(0.0, 1.0)
+        c_tp = coords_norm.clone(); c_tp[:, 1] = (c_tp[:, 1] + eps_t).clamp(0.0, 1.0)
+
+        dT_xp = model(c_xp, params_norm)
+        dT_xm = model(c_xm, params_norm)
+        dT_tp = model(c_tp, params_norm)
+
+        dT_dxx_n = (dT_xp - 2.0 * dT_c + dT_xm) / (eps_x ** 2)   # ∂²/∂x_norm²
+        dT_dt_n  = (dT_tp - dT_c) / eps_t                          # ∂/∂t_norm
+
+        dT_dt  = dT_dt_n  / t_total      # [K/s]
+        dT_dxx = dT_dxx_n / (l ** 2)     # [K/m²]
+
+        x_phys  = coords_norm[:, 0:1] * l
+        t_phys  = coords_norm[:, 1:2] * t_total
+        x_b     = x0 + v * t_phys
+        sigma_g = l / 50.0
+        Q       = i_eff * _gaussian_delta(x_phys, x_b, sigma_g)
+
+        residual = (dT_dt - alpha * dT_dxx - Q).squeeze(1)
+        return residual.abs()
+
+
 def ic_loss(
     model: nn.Module,
     coords_norm: torch.Tensor,   # (N, 2)  t_norm = 0
