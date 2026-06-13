@@ -202,10 +202,10 @@ def pde_residuals_fd(
         c_xm = coords_norm.clone(); c_xm[:, 0] = (c_xm[:, 0] - eps_x).clamp(0.0, 1.0)
         c_tp = coords_norm.clone(); c_tp[:, 1] = (c_tp[:, 1] + eps_t).clamp(0.0, 1.0)
 
-        _mark(); dT_c  = model(coords_norm, params_norm)
-        _mark(); dT_xp = model(c_xp, params_norm)
-        _mark(); dT_xm = model(c_xm, params_norm)
-        _mark(); dT_tp = model(c_tp, params_norm)
+        _mark(); dT_c  = model(coords_norm, params_norm).clone()
+        _mark(); dT_xp = model(c_xp,        params_norm).clone()
+        _mark(); dT_xm = model(c_xm,        params_norm).clone()
+        _mark(); dT_tp = model(c_tp,        params_norm).clone()
 
         dT_dxx_n = (dT_xp - 2.0 * dT_c + dT_xm) / (eps_x ** 2)   # ∂²/∂x_norm²
         dT_dt_n  = (dT_tp - dT_c) / eps_t                          # ∂/∂t_norm
