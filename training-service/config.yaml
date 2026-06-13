@@ -103,4 +103,4 @@ use_compile: false
 # Gives 1.5-2.5x speedup on consumer GPUs with tensor cores (RTX series).
 # Pure FP16 is unsafe for PINNs; AMP keeps gradient accumulation in FP32.
 # Only works on CUDA; ignored on CPU/MPS.
-use_amp: true
+use_amp: false
