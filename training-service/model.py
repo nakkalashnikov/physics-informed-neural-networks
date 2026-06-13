@@ -73,7 +73,8 @@ class PirateBlock(nn.Module):
         nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (1.0 - self.alpha) * x + self.alpha * torch.tanh(self.linear(x))
+        alpha = self.alpha.clamp(0.0, 1.0)
+        return (1.0 - alpha) * x + alpha * torch.tanh(self.linear(x))
 
 
 class PINN(nn.Module):
