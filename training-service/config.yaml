@@ -52,7 +52,7 @@ sampling:
   # Evaluates residuals at a large candidate pool, then samples proportional to |residual|.
   # Points concentrate near the moving heat source automatically.
   # Disabled by default — enable for the next training run.
-  rad_enabled:      false
+  rad_enabled:      true
   rad_pool_factor:  5     # candidate pool = pool_factor × n_pde  (40 960 points)
   rad_update_every: 50    # re-sample RAD points every N steps (cached between updates)
 
