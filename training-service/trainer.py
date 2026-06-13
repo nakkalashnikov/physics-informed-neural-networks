@@ -185,15 +185,20 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
     log.info("=" * 60)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=t_cfg["adam_lr"])
-    if start_step > 0:
-        for group in optimizer.param_groups:
-            group["initial_lr"] = t_cfg["adam_lr"]
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=t_cfg["adam_steps"],
         eta_min=t_cfg["adam_lr_min"],
-        last_epoch=start_step - 1,
     )
+    if start_step > 0:
+        # Fast-forward the scheduler step-by-step so it uses the correct
+        # closed-form cosine value at start_step.
+        # CosineAnnealingLR's get_lr() is recursive (depends on group['lr']),
+        # so last_epoch= alone won't produce the right LR when starting mid-schedule.
+        for _ in range(start_step):
+            scheduler.step()
+        log.info("Scheduler fast-forwarded to step %d  (lr=%.2e)",
+                 start_step, optimizer.param_groups[0]["lr"])
 
     model.train()
     remaining = t_cfg["adam_steps"] - start_step
