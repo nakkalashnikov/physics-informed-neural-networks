@@ -40,63 +40,55 @@ def _gaussian_delta(
 
 # ── PINN loss terms ───────────────────────────────────────────────────────────
 
+# Dimensionless source width: σ* = σ_g / l = 1/50  (parameter-independent).
+SIGMA_NORM = 1.0 / 50.0
+
+
 def pde_loss(
     model: nn.Module,
-    coords_norm: torch.Tensor,   # (N, 2)  normalised [x_n, t_n] ∈ [0,1]
-    params_norm: torch.Tensor,   # (N, 5)  normalised physics params
-    raw: dict,                   # physical scalars per point, each (N,) tensor
+    coords_norm: torch.Tensor,   # (N, 2)  dimensionless [x*, t*] ∈ [0,1]
+    pi_norm: torch.Tensor,       # (N, 3)  normalised π-groups [Fo_n, x0_n, β_n]
+    raw: dict,                   # raw π-values per point: {Fo, x0_norm, beta}, each (N,)
     epsilon: float = 1.0,        # causal weight strength ε (Wang et al. 2022)
     n_bins: int = 10,            # time windows for causal weighting
 ) -> torch.Tensor:
     """
-    Causal PDE residual loss (Wang et al., JMLR 2024).
+    Causal PDE residual loss (Wang et al., JMLR 2024) on the dimensionless PDE
 
-    Points are grouped into n_bins uniform windows along t_norm ∈ [0, 1].
-    Each bin k gets a causal weight:
+        u_t* = Fo · u_x*x*  +  S(x*, t*)
 
-        w_k = exp(−ε · Σ_{j < k} L_j)
+    where u = ΔT / T_c, x* = x/l, t* = t/t_total, Fo = α·t_total/l², and the
+    source S = δ_gauss(x*; x_b*, σ*) with x_b* = x0_norm + β·t* and σ* = 1/50.
+    Because S has a parameter-independent peak (≈ 19.95), the residual is O(1)
+    for every parameter set and the loss weights all of them equally.
 
-    where L_j is the mean squared residual in bin j.  While early-time
-    residuals are large the later bins are suppressed, forcing the network
-    to master the initial-value problem before fitting late times.
-
-    Derivative chain rule for normalised coordinates:
-        ∂ΔT/∂t_phys  =  ∂ΔT/∂t_norm  ·  (1/t_total)
-        ∂²ΔT/∂x_phys² =  ∂²ΔT/∂x_norm²  ·  (1/l²)
+    Points are grouped into n_bins uniform windows along t* ∈ [0, 1]; each bin k
+    is weighted by w_k = exp(−ε · Σ_{j<k} L_j) so early times are mastered first.
     """
     coords = coords_norm.detach().requires_grad_(True)
 
-    dT = model(coords, params_norm)               # (N, 1)
+    u = model(coords, pi_norm)                    # (N, 1)  dimensionless
 
     grad1 = torch.autograd.grad(
-        dT.sum(), coords, create_graph=True
+        u.sum(), coords, create_graph=True
     )[0]                                          # (N, 2)
-    dT_dxn = grad1[:, 0:1]                        # ∂ΔT/∂x_norm
-    dT_dtn = grad1[:, 1:2]                        # ∂ΔT/∂t_norm
+    u_xn = grad1[:, 0:1]                          # ∂u/∂x*
+    u_tn = grad1[:, 1:2]                          # ∂u/∂t*
 
-    dT_dxnxn = torch.autograd.grad(
-        dT_dxn.sum(), coords, create_graph=True
-    )[0][:, 0:1]                                  # ∂²ΔT/∂x_norm²
+    u_xnxn = torch.autograd.grad(
+        u_xn.sum(), coords, create_graph=True
+    )[0][:, 0:1]                                  # ∂²u/∂x*²
 
-    # Physical parameters  (N, 1)
-    l       = raw["l"].unsqueeze(1)
-    t_total = raw["t_total"].unsqueeze(1)
-    alpha   = raw["alpha"].unsqueeze(1)
-    i_eff   = raw["i_eff"].unsqueeze(1)
-    x0      = raw["x0"].unsqueeze(1)
-    v       = raw["v"].unsqueeze(1)
+    Fo      = raw["Fo"].unsqueeze(1)
+    x0_norm = raw["x0_norm"].unsqueeze(1)
+    beta    = raw["beta"].unsqueeze(1)
 
-    dT_dt  = dT_dtn  / t_total          # ∂ΔT/∂t  [K/s]
-    dT_dxx = dT_dxnxn / (l ** 2)        # ∂²ΔT/∂x² [K/m²]
+    x_norm = coords[:, 0:1]
+    t_norm = coords[:, 1:2]
+    x_b    = x0_norm + beta * t_norm                       # burner position in x*
+    S      = _gaussian_delta(x_norm, x_b, SIGMA_NORM)      # dimensionless source
 
-    x_phys = coords[:, 0:1] * l         # [m]
-    t_phys = coords[:, 1:2] * t_total   # [s]
-
-    x_b    = x0 + v * t_phys
-    sigma_g = l / 50.0
-    Q      = i_eff * _gaussian_delta(x_phys, x_b, sigma_g)   # [K/s]
-
-    residual = dT_dt - alpha * dT_dxx - Q          # (N, 1)
+    residual = u_tn - Fo * u_xnxn - S              # (N, 1)
     residual = torch.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0)
 
     # ── Causal time-weighting ─────────────────────────────────────────────
@@ -126,11 +118,11 @@ def pde_loss(
 
 def bc_loss(
     model: nn.Module,
-    coords_norm: torch.Tensor,   # (N, 2)  x_norm ∈ {0, 1}
-    params_norm: torch.Tensor,   # (N, 5)
+    coords_norm: torch.Tensor,   # (N, 2)  x* ∈ {0, 1}
+    params_norm: torch.Tensor,   # (N, 3)  π-groups
 ) -> torch.Tensor:
     """
-    Neumann BC: ∂ΔT/∂x = 0 at x = 0 and x = l.
+    Neumann BC: ∂u/∂x* = 0 at x* = 0 and x* = 1  (same as ∂ΔT/∂x = 0).
 
     Uses one-sided finite differences instead of autograd to avoid
     MPS numerical instability with create_graph=True.
@@ -168,69 +160,58 @@ def bc_loss(
 
 def pde_residuals_fd(
     model: nn.Module,
-    coords_norm: torch.Tensor,   # (N, 2)
-    params_norm: torch.Tensor,   # (N, 5)
-    raw: dict,
+    coords_norm: torch.Tensor,   # (N, 2)  [x*, t*]
+    pi_norm: torch.Tensor,       # (N, 3)  [Fo_n, x0_n, β_n]
+    raw: dict,                   # {Fo, x0_norm, beta}, each (N,)
     eps_x: float = 1e-3,
     eps_t: float = 1e-4,
 ) -> torch.Tensor:
     """
-    Absolute PDE residuals via finite differences — for RAD sampling only.
+    Absolute dimensionless PDE residuals via finite differences — RAD only.
 
     Uses 4 forward passes (center, x±ε, t+ε) inside torch.no_grad(), so no
-    computation graph is built. This makes it ~40× cheaper in memory than
-    autograd at the large pool sizes RAD needs (pool_factor × n_pde points).
+    computation graph is built (~40× cheaper in memory than autograd at the
+    large pool sizes RAD needs). Accuracy is sufficient for RAD: we only need
+    to know *where* residuals are large, not their exact values.
 
-    Accuracy is sufficient for RAD: we only need to know *where* residuals
-    are large, not their exact values.
+    residual = u_t* − Fo·u_x*x* − S(x*, t*)
 
     Returns: (N,) tensor of |residual| values.
     """
-    # When torch.compile uses CUDA Graphs, multiple model calls with different
-    # inputs require marking each as a new graph step to avoid buffer overwrites.
-    _mark = getattr(torch.compiler, "cudagraph_mark_step_begin", lambda: None)
-
     with torch.no_grad():
-        l       = raw["l"].unsqueeze(1)
-        t_total = raw["t_total"].unsqueeze(1)
-        alpha   = raw["alpha"].unsqueeze(1)
-        i_eff   = raw["i_eff"].unsqueeze(1)
-        x0      = raw["x0"].unsqueeze(1)
-        v       = raw["v"].unsqueeze(1)
+        Fo      = raw["Fo"].unsqueeze(1)
+        x0_norm = raw["x0_norm"].unsqueeze(1)
+        beta    = raw["beta"].unsqueeze(1)
 
         c_xp = coords_norm.clone(); c_xp[:, 0] = (c_xp[:, 0] + eps_x).clamp(0.0, 1.0)
         c_xm = coords_norm.clone(); c_xm[:, 0] = (c_xm[:, 0] - eps_x).clamp(0.0, 1.0)
         c_tp = coords_norm.clone(); c_tp[:, 1] = (c_tp[:, 1] + eps_t).clamp(0.0, 1.0)
 
-        _mark(); dT_c  = model(coords_norm, params_norm).clone()
-        _mark(); dT_xp = model(c_xp,        params_norm).clone()
-        _mark(); dT_xm = model(c_xm,        params_norm).clone()
-        _mark(); dT_tp = model(c_tp,        params_norm).clone()
+        u_c  = model(coords_norm, pi_norm)
+        u_xp = model(c_xp,        pi_norm)
+        u_xm = model(c_xm,        pi_norm)
+        u_tp = model(c_tp,        pi_norm)
 
-        dT_dxx_n = (dT_xp - 2.0 * dT_c + dT_xm) / (eps_x ** 2)   # ∂²/∂x_norm²
-        dT_dt_n  = (dT_tp - dT_c) / eps_t                          # ∂/∂t_norm
+        u_xx = (u_xp - 2.0 * u_c + u_xm) / (eps_x ** 2)   # ∂²u/∂x*²
+        u_t  = (u_tp - u_c) / eps_t                        # ∂u/∂t*
 
-        dT_dt  = dT_dt_n  / t_total      # [K/s]
-        dT_dxx = dT_dxx_n / (l ** 2)     # [K/m²]
+        x_norm = coords_norm[:, 0:1]
+        t_norm = coords_norm[:, 1:2]
+        x_b    = x0_norm + beta * t_norm
+        S      = _gaussian_delta(x_norm, x_b, SIGMA_NORM)
 
-        x_phys  = coords_norm[:, 0:1] * l
-        t_phys  = coords_norm[:, 1:2] * t_total
-        x_b     = x0 + v * t_phys
-        sigma_g = l / 50.0
-        Q       = i_eff * _gaussian_delta(x_phys, x_b, sigma_g)
-
-        residual = (dT_dt - alpha * dT_dxx - Q).squeeze(1)
+        residual = (u_t - Fo * u_xx - S).squeeze(1)
         return residual.abs()
 
 
 def ic_loss(
     model: nn.Module,
-    coords_norm: torch.Tensor,   # (N, 2)  t_norm = 0
-    params_norm: torch.Tensor,   # (N, 5)
+    coords_norm: torch.Tensor,   # (N, 2)  t* = 0
+    params_norm: torch.Tensor,   # (N, 3)  π-groups
 ) -> torch.Tensor:
     """
-    IC diagnostic: ΔT(x, 0) = 0.
-    With hard IC (model output = t_norm * NN), this is always ≈ 0.
+    IC diagnostic: u(x*, 0) = 0.
+    With hard IC (model output = t* · NN), this is always ≈ 0.
     Kept for monitoring purposes; lambda_ic = 0 in config.
     """
     dT = model(coords_norm, params_norm)
@@ -257,11 +238,11 @@ def total_loss(
     Returns:
         (total_loss, l_pde_scalar, l_bc_scalar, l_ic_scalar)
     """
-    (c_pde, p_pde, raw_pde), (c_bc, p_bc), (c_ic, p_ic) = batch
+    (c_pde, pi_pde, raw_pde), (c_bc, pi_bc), (c_ic, pi_ic) = batch
 
-    l_pde = pde_loss(model, c_pde, p_pde, raw_pde, epsilon=epsilon, n_bins=n_bins)
-    l_bc  = bc_loss(model, c_bc, p_bc)
-    l_ic  = ic_loss(model, c_ic, p_ic)
+    l_pde = pde_loss(model, c_pde, pi_pde, raw_pde, epsilon=epsilon, n_bins=n_bins)
+    l_bc  = bc_loss(model, c_bc, pi_bc)
+    l_ic  = ic_loss(model, c_ic, pi_ic)
 
     total = weights["pde"] * l_pde + weights["bc"] * l_bc + weights["ic"] * l_ic
     return total, l_pde.item(), l_bc.item(), l_ic.item()

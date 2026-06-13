@@ -27,7 +27,9 @@ from tqdm import tqdm
 
 from model import PINN, build_model
 from physics import total_loss, analytical_delta_T
-from sampler import Normalizer, build_batch, sample_params, rad_resample_pde
+from sampler import (
+    Normalizer, build_batch, sample_params, rad_resample_pde, compute_pi_groups,
+)
 
 log = logging.getLogger(__name__)
 
@@ -94,7 +96,9 @@ def validate(
     model.eval()
     dtype = next(model.parameters()).dtype
     raw = sample_params(n_test, cfg, device)
+    pi  = compute_pi_groups(raw)
     x_pts_norm = np.linspace(0.0, 1.0, 100)
+    n = 100
     errors: list[float] = []
 
     with torch.no_grad():
@@ -106,22 +110,25 @@ def validate(
             x0     = raw["x0"][k].item()
             v      = raw["v"][k].item()
             t_tot  = raw["t_total"][k].item()
-            i_eff  = raw["i_eff"][k].item()
 
             t_q    = t_tot * 0.7
-            t_norm = torch.full((100,), t_q / t_tot, device=device, dtype=dtype)
+            t_norm = torch.full((n,), t_q / t_tot, device=device, dtype=dtype)
             x_norm = torch.tensor(x_pts_norm, dtype=dtype, device=device)
             coords = torch.stack([x_norm, t_norm], dim=1)
 
-            n = 100
-            alpha_n  = normalizer.norm(torch.full((n,), alpha,  device=device, dtype=dtype), "alpha")
-            l_n      = normalizer.norm(torch.full((n,), l,      device=device, dtype=dtype), "l")
-            i_eff_n  = normalizer.norm(torch.full((n,), i_eff,  device=device, dtype=dtype), "i_eff")
-            x0_n     = torch.full((n,), x0 / l, device=device, dtype=dtype)
-            v_n      = normalizer.norm(torch.full((n,), v,      device=device, dtype=dtype), "v")
-            params   = torch.stack([alpha_n, l_n, i_eff_n, x0_n, v_n], dim=1)
+            # Network input: the three normalised π-groups for this parameter set.
+            fo_n   = normalizer.norm_log(
+                torch.full((n,), pi["Fo"][k].item(),      device=device, dtype=dtype), "Fo")
+            x0_n   = normalizer.norm(
+                torch.full((n,), pi["x0_norm"][k].item(), device=device, dtype=dtype), "x0_frac")
+            beta_n = normalizer.norm(
+                torch.full((n,), pi["beta"][k].item(),    device=device, dtype=dtype), "beta")
+            pi_norm = torch.stack([fo_n, x0_n, beta_n], dim=1)
 
-            dT_pred = model(coords, params).squeeze().cpu().numpy()
+            # Network outputs dimensionless u; rescale to physical ΔT.
+            T_c     = pi["T_c"][k].item()
+            u_pred  = model(coords, pi_norm).squeeze().cpu().numpy()
+            dT_pred = T_c * u_pred
 
             x_phys = x_pts_norm * l
             dT_ref = analytical_delta_T(x_phys, t_q, alpha, rho_c, l, intens, x0, v)

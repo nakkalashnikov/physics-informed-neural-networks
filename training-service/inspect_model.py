@@ -48,7 +48,7 @@ cfg = {
 
 # ── Rebuild model ─────────────────────────────────────────────────────────────
 from model import build_model
-from sampler import Normalizer, sample_params
+from sampler import Normalizer, sample_params, compute_pi_groups
 from physics import analytical_delta_T
 
 model = build_model(cfg)
@@ -66,6 +66,7 @@ device = torch.device("cpu")
 # ── Sample random parameter sets ─────────────────────────────────────────────
 torch.manual_seed(0)
 raw = sample_params(args.n, cfg, device)
+pi  = compute_pi_groups(raw)
 
 print(f"\n{'─'*70}")
 print(f"{'Set':>3}  {'α':>10}  {'l':>5}  {'i_eff':>9}  {'v':>6}  "
@@ -96,14 +97,13 @@ with torch.no_grad():
         t_norm = torch.full((n,), t_q / t_tot)
         coords = torch.stack([x_norm, t_norm], dim=1)
 
-        alpha_n  = normalizer.norm(torch.full((n,), alpha),  "alpha")
-        l_n      = normalizer.norm(torch.full((n,), l),      "l")
-        i_eff_n  = normalizer.norm(torch.full((n,), i_eff),  "i_eff")
-        x0_n     = torch.full((n,), x0 / l)
-        v_n      = normalizer.norm(torch.full((n,), v),      "v")
-        params   = torch.stack([alpha_n, l_n, i_eff_n, x0_n, v_n], dim=1)
+        fo_n    = normalizer.norm_log(torch.full((n,), pi["Fo"][k].item()),      "Fo")
+        x0_n    = normalizer.norm(    torch.full((n,), pi["x0_norm"][k].item()), "x0_frac")
+        beta_n  = normalizer.norm(    torch.full((n,), pi["beta"][k].item()),    "beta")
+        pi_norm = torch.stack([fo_n, x0_n, beta_n], dim=1)
 
-        dT_pred = model(coords, params).squeeze().numpy()
+        T_c     = pi["T_c"][k].item()
+        dT_pred = model(coords, pi_norm).squeeze().numpy() * T_c
 
         x_phys  = x_pts * l
         dT_ref  = analytical_delta_T(x_phys, t_q, alpha, rho_c, l, intens, x0, v)

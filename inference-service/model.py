@@ -1,15 +1,20 @@
 """
-Fourier Feature PINN for 1D heat equation with a moving heat source.
+Fourier Feature PINN for the 1D heat equation with a moving heat source.
 
-Network: (x_norm, t_norm, α_n, l_n, i_eff_n, x0_n, v_n) → ΔT
-         where ΔT = T − T_amb  (temperature rise above ambient).
+Network: (x*, t*, Fo_n, x0_n, β_n) → u   (dimensionless solution)
+         where u = ΔT / T_c.  The physical temperature ΔT = T_c · u is
+         recovered by the caller (T_c = i_eff·t_total/l); the network never
+         sees the temperature scale, so a single O(1) output covers the whole
+         parameter space (ΔT itself spans ~3 orders of magnitude).
 
-Coordinate inputs (x_norm, t_norm) pass through a random Fourier feature
-encoding to overcome spectral bias in standard MLPs.  Physics parameters
-are normalised to [0, 1] and appended directly after the encoding.
+The problem is reduced via Buckingham-π to three dimensionless groups
+(Fourier number Fo, burner start x0_norm, burner travel β) — see sampler.py.
 
-IC is hard-enforced by multiplying the network output by t_norm, which
-guarantees ΔT(x, 0) = 0 for all inputs without a soft penalty term.
+Coordinate inputs (x*, t*) pass through a random Fourier feature encoding to
+overcome spectral bias; the three π-groups are appended after the encoding.
+
+IC is hard-enforced by multiplying the network output by t*, which guarantees
+u(x*, 0) = 0 for all inputs without a soft penalty term.
 
 Fourier sigma is annealed during training via set_sigma(): the network
 starts learning smooth global structure (low σ) and gradually gains access
@@ -105,14 +110,14 @@ class PINN(nn.Module):
 
     Input layout
     ─────────────
-    coords_norm : (N, 2)  –  [x_norm, t_norm] ∈ [0, 1]
-    params_norm : (N, 5)  –  [α_n, l_n, i_eff_n, x0_n, v_n] ∈ [0, 1]
+    coords_norm : (N, 2)  –  [x*, t*] ∈ [0, 1]
+    pi_norm     : (N, 3)  –  [Fo_n, x0_n, β_n] ∈ [0, 1]
 
     Output
     ──────
-    delta_T : (N, 1)  –  ΔT = T − T_amb  [K]
+    u : (N, 1)  –  dimensionless solution (ΔT = T_c · u)
 
-    Hard IC: output = t_norm * net(features), so ΔT(x, 0) ≡ 0.
+    Hard IC: output = t* * net(features), so u(x*, 0) ≡ 0.
     """
 
     def __init__(
@@ -125,7 +130,7 @@ class PINN(nn.Module):
         super().__init__()
 
         self.fourier = FourierFeatures(d_in=2, m=fourier_m, sigma=fourier_sigma)
-        d_in_mlp = self.fourier.out_dim + 5   # 128 + 5 = 133
+        d_in_mlp = self.fourier.out_dim + 3   # 128 + 3 π-groups = 131
 
         # Shared encoders U and V — computed once per forward pass,
         # shared across all PirateBlocks
@@ -154,10 +159,10 @@ class PINN(nn.Module):
     def forward(
         self,
         coords_norm: torch.Tensor,
-        params_norm: torch.Tensor,
+        pi_norm: torch.Tensor,
     ) -> torch.Tensor:
         encoded  = self.fourier(coords_norm)                     # (N, 128)
-        features = torch.cat([encoded, params_norm], dim=-1)     # (N, 133)
+        features = torch.cat([encoded, pi_norm], dim=-1)         # (N, 131)
         t_norm   = coords_norm[:, 1:2]                           # (N,   1)
 
         # Shared encoders — computed once, reused in every block

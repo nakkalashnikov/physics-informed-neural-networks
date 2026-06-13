@@ -44,6 +44,11 @@ class Normalizer:
         lo, hi = self.bounds[key]
         return (val - lo) / (hi - lo)
 
+    def norm_log(self, val: torch.Tensor, key: str) -> torch.Tensor:
+        lo, hi = self.bounds[key]
+        log_lo, log_hi = math.log(lo), math.log(hi)
+        return (torch.log(val.clamp_min(1e-30)) - log_lo) / (log_hi - log_lo)
+
 
 # ── Analytical reference solution ─────────────────────────────────────────────
 
@@ -103,9 +108,12 @@ class Predictor:
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         m_cfg = ckpt["model_cfg"]
+        # The Fourier σ is a buffer restored by load_state_dict, so the value
+        # passed here is irrelevant; fall back across the config key variants.
+        sigma0 = m_cfg.get("fourier_sigma_start", m_cfg.get("fourier_sigma", 1.0))
         self.model = PINN(
             fourier_m=m_cfg["fourier_m"],
-            fourier_sigma=m_cfg["fourier_sigma"],
+            fourier_sigma=sigma0,
             hidden_layers=m_cfg["hidden_layers"],
             hidden_size=m_cfg["hidden_size"],
         ).to(self.device)
@@ -119,29 +127,29 @@ class Predictor:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _build_params_norm(
-        self,
-        alpha: float,
-        l: float,
-        i_eff: float,
-        x0: float,
-        v: float,
-        n: int,
+    def _pi_groups(
+        self, alpha: float, l: float, i_eff: float, x0: float, v: float, t_total: float
+    ) -> tuple[float, float, float, float]:
+        """Physical params → (Fo, x0_norm, beta, T_c) — see sampler.compute_pi_groups."""
+        Fo      = alpha * t_total / (l ** 2)
+        x0_norm = x0 / l
+        beta    = v * t_total / l
+        T_c     = i_eff * t_total / l
+        return Fo, x0_norm, beta, T_c
+
+    def _build_pi_norm(
+        self, Fo: float, x0_norm: float, beta: float, n: int
     ) -> torch.Tensor:
-        """Build (n, 5) normalised parameter tensor."""
+        """Build (n, 3) normalised π-group tensor [Fo_n, x0_n, β_n]."""
         dev = self.device
 
-        def col(val: float, key: str) -> torch.Tensor:
-            return self.normalizer.norm(
-                torch.full((n,), val, dtype=torch.float32, device=dev), key
-            )
+        def full(val: float) -> torch.Tensor:
+            return torch.full((n,), val, dtype=torch.float32, device=dev)
 
-        alpha_n = col(alpha, "alpha")
-        l_n     = col(l,     "l")
-        i_eff_n = col(i_eff, "i_eff")
-        x0_n    = torch.full((n,), x0 / l, dtype=torch.float32, device=dev)
-        v_n     = col(v,     "v")
-        return torch.stack([alpha_n, l_n, i_eff_n, x0_n, v_n], dim=1)
+        fo_n   = self.normalizer.norm_log(full(Fo),      "Fo")
+        x0_n   = self.normalizer.norm(    full(x0_norm), "x0_frac")
+        beta_n = self.normalizer.norm(    full(beta),    "beta")
+        return torch.stack([fo_n, x0_n, beta_n], dim=1)
 
     def _coords_norm(
         self, x_phys: np.ndarray, t_phys: float, l: float, t_total: float
@@ -170,10 +178,12 @@ class Predictor:
         rho_c  = mat["rho_c"]
         i_eff  = intensity / rho_c
 
+        Fo, x0_norm, beta, T_c = self._pi_groups(alpha, length, i_eff, x0, velocity, t_total)
         coords = self._coords_norm(np.array([x_query]), t_query, length, t_total)
-        params = self._build_params_norm(alpha, length, i_eff, x0, velocity, 1)
+        pi     = self._build_pi_norm(Fo, x0_norm, beta, 1)
 
-        dT_pinn = float(self.model(coords, params).item())
+        # Network outputs dimensionless u; rescale to physical ΔT.
+        dT_pinn = float(self.model(coords, pi).item()) * T_c
 
         dT_ref = float(
             analytical_delta_T(
@@ -216,10 +226,12 @@ class Predictor:
         rho_c = mat["rho_c"]
         i_eff = intensity / rho_c
 
+        Fo, x0_norm, beta, T_c = self._pi_groups(alpha, length, i_eff, x0, velocity, t_total)
+
         x_phys = np.linspace(0.0, length,  nx)   # (nx,)
         t_phys = np.linspace(0.0, t_total, nt)   # (nt,)
 
-        # Build flattened grid: (nt*nx, 2) coords and (nt*nx, 5) params
+        # Build flattened grid: (nt*nx, 2) coords and (nt*nx, 3) π-groups
         x_grid, t_grid = np.meshgrid(x_phys, t_phys)   # both (nt, nx)
         x_flat = x_grid.ravel()                          # (nt*nx,)
         t_flat = t_grid.ravel()
@@ -227,9 +239,10 @@ class Predictor:
         x_n = torch.tensor(x_flat / length,  dtype=torch.float32, device=self.device)
         t_n = torch.tensor(t_flat / t_total, dtype=torch.float32, device=self.device)
         coords = torch.stack([x_n, t_n], dim=1)                    # (N, 2)
-        params = self._build_params_norm(alpha, length, i_eff, x0, velocity, len(x_flat))
+        pi     = self._build_pi_norm(Fo, x0_norm, beta, len(x_flat))
 
-        dT_pinn_flat = self.model(coords, params).squeeze().cpu().numpy()
+        # Network outputs dimensionless u; rescale to physical ΔT.
+        dT_pinn_flat = self.model(coords, pi).squeeze().cpu().numpy() * T_c
         dT_pinn = dT_pinn_flat.reshape(nt, nx)
 
         # Analytical solution row-by-row (varies with t)
