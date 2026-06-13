@@ -141,7 +141,7 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
         log.info("FP64 mode enabled (double precision)")
 
     use_amp = bool(cfg.get("use_amp", False)) and device.type == "cuda" and not use_fp64
-    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     start_step = 0
     if resume:
