@@ -61,23 +61,29 @@ class FourierFeatures(nn.Module):
 
 class PirateBlock(nn.Module):
     """
-    Full PirateNet residual block (Wang et al., JMLR 2024).
+    Full PirateNet residual block (Wang et al., JMLR 2024 / jaxpi PIModifiedBottleneck).
 
-    Forward:
-        h   = tanh(W · x + b)
-        h   = h ⊙ u + (1 − h) ⊙ v      shared encoders gate the transform
-        out = α · h + (1 − α) · x        learnable residual skip
+    Three Dense layers per block; U/V gating applied after the first two:
+        h = tanh(W1 · x)
+        h = h ⊙ u + (1 − h) ⊙ v      ← gate 1
+        h = tanh(W2 · h)
+        h = h ⊙ u + (1 − h) ⊙ v      ← gate 2
+        h = tanh(W3 · h)               ← no gate
+        out = α · h + (1 − α) · x     ← learnable residual skip
 
     u and v are shared across all blocks and passed in from PINN.forward().
-    α is a per-block scalar initialised to 0 (no clamp — paper is unconstrained).
+    α is a per-block scalar initialised to 0, unconstrained per paper.
     """
 
     def __init__(self, size: int):
         super().__init__()
-        self.linear = nn.Linear(size, size)
-        self.alpha  = nn.Parameter(torch.zeros(1))
-        nn.init.xavier_uniform_(self.linear.weight)
-        nn.init.zeros_(self.linear.bias)
+        self.linear1 = nn.Linear(size, size)
+        self.linear2 = nn.Linear(size, size)
+        self.linear3 = nn.Linear(size, size)
+        self.alpha   = nn.Parameter(torch.zeros(1))
+        for layer in [self.linear1, self.linear2, self.linear3]:
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
 
     def forward(
         self,
@@ -85,8 +91,11 @@ class PirateBlock(nn.Module):
         u: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
-        h = torch.tanh(self.linear(x))
+        h = torch.tanh(self.linear1(x))
         h = h * u + (1.0 - h) * v
+        h = torch.tanh(self.linear2(h))
+        h = h * u + (1.0 - h) * v
+        h = torch.tanh(self.linear3(h))
         return self.alpha * h + (1.0 - self.alpha) * x
 
 
