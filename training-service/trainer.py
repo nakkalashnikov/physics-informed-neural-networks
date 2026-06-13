@@ -159,6 +159,9 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
     log.info("=" * 60)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=t_cfg["adam_lr"])
+    if start_step > 0:
+        for group in optimizer.param_groups:
+            group["initial_lr"] = t_cfg["adam_lr"]
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=t_cfg["adam_steps"],
