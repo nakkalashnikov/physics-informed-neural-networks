@@ -43,6 +43,11 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
         torch.set_float32_matmul_precision("high")  # enables TF32 on Ampere+
+        # pde_loss uses create_graph=True (second-order autograd for ∂²ΔT/∂x²).
+        # torch.compile's donated-buffer optimisation assumes create_graph=False
+        # and raises at backward time. Disable it globally.
+        if hasattr(torch, "_functorch") and hasattr(torch._functorch, "config"):
+            torch._functorch.config.donated_buffer = False
 
     from trainer import train
     train(cfg, device, resume=args.resume)
