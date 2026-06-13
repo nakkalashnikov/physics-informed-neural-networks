@@ -113,12 +113,22 @@ def _save(
 
 # ── Main training function ────────────────────────────────────────────────────
 
-def train(cfg: dict, device: torch.device) -> None:
+def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
     os.makedirs(cfg["training"]["checkpoint_dir"], exist_ok=True)
 
     model = build_model(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     log.info("Model: %d trainable parameters", n_params)
+
+    start_step = 0
+    if resume:
+        ckpt = torch.load(resume, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        # infer step from filename, e.g. model_55000.pt → 55000
+        import re
+        m = re.search(r"model_(\d+)\.pt", resume)
+        start_step = int(m.group(1)) if m else 0
+        log.info("Resumed from %s  (start_step=%d)", resume, start_step)
 
     normalizer = Normalizer(cfg)
     t_cfg = cfg["training"]
@@ -153,10 +163,12 @@ def train(cfg: dict, device: torch.device) -> None:
         optimizer,
         T_max=t_cfg["adam_steps"],
         eta_min=t_cfg["adam_lr_min"],
+        last_epoch=start_step - 1,
     )
 
     model.train()
-    pbar = tqdm(range(t_cfg["adam_steps"]), desc="Adam", dynamic_ncols=True)
+    remaining = t_cfg["adam_steps"] - start_step
+    pbar = tqdm(range(start_step, t_cfg["adam_steps"]), desc="Adam", dynamic_ncols=True)
 
     for step in pbar:
 

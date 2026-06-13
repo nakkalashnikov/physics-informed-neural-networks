@@ -29,6 +29,7 @@ def _get_device(cfg_device: str) -> torch.device:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train PINN for 1D heat equation")
     parser.add_argument("--config", default="config.yaml", help="Path to config YAML")
+    parser.add_argument("--resume", default=None, help="Resume from checkpoint, e.g. checkpoints/model_55000.pt")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -43,7 +44,7 @@ def main() -> None:
         torch.cuda.manual_seed_all(seed)
 
     from trainer import train
-    train(cfg, device)
+    train(cfg, device, resume=args.resume)
 
 
 if __name__ == "__main__":
