@@ -51,7 +51,7 @@ sampling:
 # ── Training ────────────────────────────────────────────────────────────────
 training:
   # Phase 1: Adam + cosine LR annealing
-  adam_steps:   80000
+  adam_steps:   120000
   adam_lr:      5.0e-4
   adam_lr_min:  1.0e-5
 

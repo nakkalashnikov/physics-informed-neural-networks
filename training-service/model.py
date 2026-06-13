@@ -15,11 +15,18 @@ Fourier sigma is annealed during training via set_sigma(): the network
 starts learning smooth global structure (low σ) and gradually gains access
 to higher frequencies needed to capture the narrow moving heat source.
 
-Hidden layers use the PirateNet residual block (Wang et al., JMLR 2024):
-    H_next = (1 − α) · H  +  α · tanh(W · H + b)
-where α is a learnable scalar initialised to 0.  At the start of training
-all blocks act as identity maps (shallow network); α grows during training
-to progressively unlock depth as needed.
+Hidden layers use the full PirateNet architecture (Wang et al., JMLR 2024):
+
+  1. Two shared encoders U, V computed once from input features:
+       U = tanh(W_u · features),   V = tanh(W_v · features)
+
+  2. Each PirateBlock:
+       h   = tanh(W · h_prev + b)       standard transform
+       h   = h ⊙ U + (1 − h) ⊙ V       element-wise gating with shared U, V
+       out = α · h + (1 − α) · h_prev   residual with learnable scalar gate
+
+  α is initialised to 0 (identity map at start) and unconstrained —
+  the paper reports it stabilises around O(10⁻²) during training.
 """
 
 import math
@@ -39,7 +46,7 @@ class FourierFeatures(nn.Module):
 
     def __init__(self, d_in: int, m: int, sigma: float):
         super().__init__()
-        B = torch.randn(m, d_in)                      # unit Gaussian directions, frozen
+        B = torch.randn(m, d_in)
         self.register_buffer("B", B)
         self.register_buffer("sigma", torch.tensor(float(sigma)))
         self.out_dim = 2 * m
@@ -48,38 +55,44 @@ class FourierFeatures(nn.Module):
         self.sigma.fill_(sigma)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., d_in)  →  (..., 2m)
         proj = 2.0 * math.pi * self.sigma * (x @ self.B.T)
         return torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)
 
 
 class PirateBlock(nn.Module):
     """
-    PirateNet residual block (Wang et al., JMLR 2024).
+    Full PirateNet residual block (Wang et al., JMLR 2024).
 
-    H_next = (1 − α) · H  +  α · tanh(W · H + b)
+    Forward:
+        h   = tanh(W · x + b)
+        h   = h ⊙ u + (1 − h) ⊙ v      shared encoders gate the transform
+        out = α · h + (1 − α) · x        learnable residual skip
 
-    α is a learnable scalar per block, initialised to 0.
-    At α=0 the block is an identity map; as α grows the block becomes
-    a standard tanh layer.  This lets the network start shallow and
-    progressively unlock depth during training.
+    u and v are shared across all blocks and passed in from PINN.forward().
+    α is a per-block scalar initialised to 0 (no clamp — paper is unconstrained).
     """
 
     def __init__(self, size: int):
         super().__init__()
         self.linear = nn.Linear(size, size)
-        self.alpha  = nn.Parameter(torch.zeros(1))   # gate: 0 = identity
+        self.alpha  = nn.Parameter(torch.zeros(1))
         nn.init.xavier_uniform_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        alpha = self.alpha.clamp(0.0, 1.0)
-        return (1.0 - alpha) * x + alpha * torch.tanh(self.linear(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        u: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        h = torch.tanh(self.linear(x))
+        h = h * u + (1.0 - h) * v
+        return self.alpha * h + (1.0 - self.alpha) * x
 
 
 class PINN(nn.Module):
     """
-    Parameterised Physics-Informed Neural Network with PirateNet hidden layers.
+    Parameterised Physics-Informed Neural Network with full PirateNet layers.
 
     Input layout
     ─────────────
@@ -103,27 +116,30 @@ class PINN(nn.Module):
         super().__init__()
 
         self.fourier = FourierFeatures(d_in=2, m=fourier_m, sigma=fourier_sigma)
+        d_in_mlp = self.fourier.out_dim + 5   # 128 + 5 = 133
 
-        # 128 Fourier features + 5 normalised physics parameters
-        d_in_mlp = self.fourier.out_dim + 5
+        # Shared encoders U and V — computed once per forward pass,
+        # shared across all PirateBlocks
+        self.encoder_u = nn.Linear(d_in_mlp, hidden_size)
+        self.encoder_v = nn.Linear(d_in_mlp, hidden_size)
 
-        # Input projection: plain linear + tanh (no gate needed here)
+        # Input projection
         self.input_layer = nn.Linear(d_in_mlp, hidden_size)
-        nn.init.xavier_uniform_(self.input_layer.weight)
-        nn.init.zeros_(self.input_layer.bias)
 
-        # PirateNet residual blocks (one fewer than hidden_layers)
+        # PirateNet residual blocks
         self.blocks = nn.ModuleList([
             PirateBlock(hidden_size) for _ in range(hidden_layers - 1)
         ])
 
         # Output projection
         self.output_layer = nn.Linear(hidden_size, 1)
-        nn.init.xavier_uniform_(self.output_layer.weight)
-        nn.init.zeros_(self.output_layer.bias)
+
+        for layer in [self.encoder_u, self.encoder_v,
+                      self.input_layer, self.output_layer]:
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
 
     def set_sigma(self, sigma: float) -> None:
-        """Update Fourier bandwidth. Call once per training step."""
         self.fourier.set_sigma(sigma)
 
     def forward(
@@ -131,15 +147,19 @@ class PINN(nn.Module):
         coords_norm: torch.Tensor,
         params_norm: torch.Tensor,
     ) -> torch.Tensor:
-        encoded  = self.fourier(coords_norm)                        # (N, 128)
-        features = torch.cat([encoded, params_norm], dim=-1)        # (N, 133)
-        t_norm   = coords_norm[:, 1:2]                              # (N,   1)
+        encoded  = self.fourier(coords_norm)                     # (N, 128)
+        features = torch.cat([encoded, params_norm], dim=-1)     # (N, 133)
+        t_norm   = coords_norm[:, 1:2]                           # (N,   1)
 
-        h = torch.tanh(self.input_layer(features))                  # (N, 256)
+        # Shared encoders — computed once, reused in every block
+        u = torch.tanh(self.encoder_u(features))                 # (N, 256)
+        v = torch.tanh(self.encoder_v(features))                 # (N, 256)
+
+        h = torch.tanh(self.input_layer(features))               # (N, 256)
         for block in self.blocks:
-            h = block(h)                                            # (N, 256)
+            h = block(h, u, v)                                   # (N, 256)
 
-        return t_norm * self.output_layer(h)                        # hard IC
+        return t_norm * self.output_layer(h)                     # hard IC
 
 
 def build_model(cfg: dict) -> PINN:
