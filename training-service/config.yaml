@@ -43,10 +43,10 @@ model:
 
 # ── Collocation point sampling ──────────────────────────────────────────────
 sampling:
-  n_pde:              32768  # interior PDE residual points per step  (4x for RTX 5090)
-  n_bc:               2048   # boundary condition points per step (split x=0 / x=l)
-  n_ic:               2048   # initial condition points (kept for diagnostics only)
-  n_params_per_step:  32     # number of physics-parameter sets sampled per step
+  n_pde:              8192   # interior PDE residual points per step
+  n_bc:               512    # boundary condition points per step (split x=0 / x=l)
+  n_ic:               512    # initial condition points (kept for diagnostics only)
+  n_params_per_step:  16     # number of physics-parameter sets sampled per step
 
   # RAD — Residual-based Adaptive Distribution (arXiv:2207.10289)
   # Evaluates residuals at a large candidate pool, then samples proportional to |residual|.
@@ -94,6 +94,10 @@ seed:   42
 # Effect is smaller for Adam than for L-BFGS (~10-20% error reduction).
 # Slows training ~1.5x and doubles VRAM usage.
 use_fp64: false
+
+# torch.compile — fuses CUDA kernels, reduces CPU launch overhead (~20-40% speedup).
+# mode="reduce-overhead" uses CUDA Graphs internally for repeated kernel patterns.
+use_compile: true
 
 # AMP — Automatic Mixed Precision (forward in FP16, gradients in FP32).
 # Gives 1.5-2.5x speedup on consumer GPUs with tensor cores (RTX series).

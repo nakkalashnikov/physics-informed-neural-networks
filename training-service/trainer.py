@@ -143,6 +143,10 @@ def train(cfg: dict, device: torch.device, resume: str | None = None) -> None:
     use_amp = bool(cfg.get("use_amp", False)) and device.type == "cuda" and not use_fp64
     scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    if cfg.get("use_compile", False) and hasattr(torch, "compile"):
+        model = torch.compile(model, mode="reduce-overhead")
+        log.info("torch.compile enabled (mode=reduce-overhead)")
+
     start_step = 0
     if resume:
         ckpt = torch.load(resume, map_location=device)
