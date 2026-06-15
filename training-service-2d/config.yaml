@@ -1,0 +1,93 @@
+# PI-DeepONet 2D moving heat source — all hyperparameters.
+# See .claude/specs/pinn-2d-pideeponet-forward.md for the contract. Values are fixed.
+
+physics:
+  # Independent pi-groups (sampled per training case)
+  Fo_min: 3.0e-6        # Fourier number alpha*t_end/l^2 (log-uniform)
+  Fo_max: 3.0e-2
+  AR_min: 0.02          # aspect ratio h/l
+  AR_max: 0.30
+  w_min: 0.02           # relative contact width S/l
+  w_max: 0.20
+  # Reference dimensional scales (T_c absorbs the true power/time scale)
+  P_ref: 1.0            # burner power per unit depth [W/m]
+  t_end_ref: 1.0        # run duration [s]
+  sigma_factor: 6.0     # gaussian std sigma_s = S / sigma_factor
+
+trajectory:
+  k_sensors: 101        # branch input length (recording samples)
+  n_fourier_modes: 5    # J: random Fourier series modes
+  spectrum_decay: 2.0   # p: amplitude ~ sigma0 / j^p
+  sigma0: 1.0
+  x_margin: 0.05        # trajectory stays in [margin, 1-margin]
+  speed_max_star: 4.0   # cap on |dx_b*/dt*|
+
+branch:
+  hidden: [256, 256, 256]
+  out_dim: 128          # p (latent width, must match trunk.out_dim)
+
+trunk:
+  rff_num_features: 64          # -> 128 after sin/cos
+  rff_sigma_start: 1.0
+  rff_sigma_end: 3.5
+  n_pirate_blocks: 3
+  width: 256
+  out_dim: 128          # p
+
+loss:
+  lambda_data: 10.0
+  lambda_pde: 1.0
+  lambda_bc: 10.0
+  lambda_ic: 0.0        # hard-enforced, no term
+
+batch:
+  n_traj_per_batch: 16
+  n_interior: 1024
+  n_bc0: 256            # flux boundary y*=0
+  n_bc_ins: 256         # other (insulated) edges
+  n_data: 512           # Fourier label points
+
+training:
+  optimizer: adam
+  lr: 1.0e-3
+  lr_min: 1.0e-5
+  total_steps: 200000
+  grad_clip_norm: 1.0
+  use_amp: false        # incompatible with sharp source (1D notes)
+  use_compile: false    # incompatible with create_graph=True (1D notes)
+  use_fp64: false
+  use_prefetch: true    # auto-off on CPU/MPS
+  seed: 0
+  checkpoint_every: 5000
+  validate_every: 5000
+
+analytic:
+  fourier_M: 64         # x-modes
+  fourier_N: 48         # y-modes
+  quad_nx: 400          # x quadrature points for Q_m
+  quad_nt: 2000         # tau quadrature points for convolution
+
+cache:
+  n_cases: 100000       # distinct (trajectory, pi) cases to precompute labels for (~750 MB, ~860 MB RAM)
+  n_data_per_case: 512  # analytic label points per case
+  label_M: 48           # Fourier x-modes for labels (cheaper than validation field)
+  label_N: 32           # Fourier y-modes for labels
+  label_ntau: 400       # tau quadrature for labels
+  path: labels.npz
+
+fdm:
+  nx: 201
+  ny: 101
+  nt: 400               # Crank-Nicolson steps (uses sparse solve)
+  r_target: 0.4         # explicit-stability target if explicit fallback used
+
+validation:
+  pi_table_n_cases: 64
+  ensemble_size: 5
+  thresholds:
+    l2_green: 0.02
+    l2_yellow: 0.05
+    energy_green: 0.02
+    energy_yellow: 0.05
+    defect_green: 0.03
+    defect_yellow: 0.08

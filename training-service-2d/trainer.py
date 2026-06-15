@@ -1,0 +1,154 @@
+"""
+Hybrid-loss training loop for the PI-DeepONet.
+
+    L = lambda_data * L_data  +  lambda_pde * L_pde  +  lambda_bc * L_bc
+    all terms are RELATIVE (divided by per-trajectory label scale) so the ~7-order Q* spread
+    across the parameter space does not let loud samples dominate (see data.py).
+
+Adam + cosine LR, RFF sigma curriculum, gradient-norm clipping, non-finite-gradient guard
+(MPS/sharp-source safety, per project memory). AMP/compile/FP64 stay off.
+"""
+
+from __future__ import annotations
+
+import time
+
+import torch
+
+from data import Batch, BatchPrefetcher, CachedBatcher, build_batch
+from model import build_model
+from physics import bc_flux_residual, bc_insulation_residual, pde_residual
+
+
+def select_device(name: str | None) -> torch.device:
+    if name:
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _t(arr, device, grad=False):
+    x = torch.as_tensor(arr, dtype=torch.float32, device=device)
+    if grad:
+        x.requires_grad_(True)
+    return x
+
+
+def _sigma_at(step: int, total: int, cfg: dict) -> float:
+    a = float(cfg["trunk"]["rff_sigma_start"])
+    b = float(cfg["trunk"]["rff_sigma_end"])
+    return a + (b - a) * min(step / max(total, 1), 1.0)
+
+
+def compute_losses(model, batch: Batch, device, sigma_factor: float) -> dict:
+    """Return dict of the three relative loss components (+ total)."""
+    # --- data loss ---
+    db = _t(batch.data_branch, device)
+    dc = _t(batch.data_coords, device)
+    du = _t(batch.data_u, device)
+    ds = _t(batch.data_scale, device)
+    u_pred = model(db, dc)
+    L_data = (((u_pred - du) / ds) ** 2).mean()
+
+    # --- pde residual ---
+    ib = _t(batch.int_branch, device)
+    ic = _t(batch.int_coords, device, grad=True)
+    Fo = _t(batch.int_Fo, device)
+    AR = _t(batch.int_AR, device)
+    isc = _t(batch.int_scale, device)
+    R = pde_residual(model, ib, ic, Fo, AR)
+    L_pde = ((R / isc) ** 2).mean()
+
+    # --- flux BC at yhat=0 ---
+    bb = _t(batch.bc0_branch, device)
+    bc = _t(batch.bc0_coords, device, grad=True)
+    Q = _t(batch.bc0_Q, device)
+    xb = _t(batch.bc0_xb, device)
+    w = _t(batch.bc0_w, device)
+    bfs = _t(batch.bc0_fluxscale, device)
+    R_bc0 = bc_flux_residual(model, bb, bc, Q, xb, w, sigma_factor)
+    L_bc0 = ((R_bc0 / bfs) ** 2).mean()
+
+    # --- insulated edges ---
+    xb_ = _t(batch.insx_branch, device)
+    xc_ = _t(batch.insx_coords, device, grad=True)
+    xsc = _t(batch.insx_scale, device)
+    R_insx = bc_insulation_residual(model, xb_, xc_, axis=0)
+    L_insx = ((R_insx / xsc) ** 2).mean()
+
+    yb_ = _t(batch.insy_branch, device)
+    yc_ = _t(batch.insy_coords, device, grad=True)
+    ysc = _t(batch.insy_scale, device)
+    R_insy = bc_insulation_residual(model, yb_, yc_, axis=1)
+    L_insy = ((R_insy / ysc) ** 2).mean()
+
+    L_bc = L_bc0 + L_insx + L_insy
+    return {"data": L_data, "pde": L_pde, "bc": L_bc}
+
+
+def train(cfg: dict, device: torch.device, total_steps: int | None = None,
+          use_prefetch: bool | None = None, log_every: int = 50,
+          checkpoint_path: str = "checkpoint.pt", cache_path: str | None = None) -> str:
+    tr = cfg["training"]
+    total = int(total_steps if total_steps is not None else tr["total_steps"])
+    seed = int(tr["seed"])
+    torch.manual_seed(seed)
+
+    model = build_model(cfg).to(device)
+    lam = cfg["loss"]
+    sf = float(cfg["physics"]["sigma_factor"])
+
+    opt = torch.optim.Adam(model.parameters(), lr=float(tr["lr"]))
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total, eta_min=float(tr["lr_min"]))
+    clip = float(tr["grad_clip_norm"])
+
+    import numpy as np
+    if cache_path is not None:                       # cached labels -> cheap on-the-fly batches
+        source = CachedBatcher(cfg, seed, path=cache_path)
+        pf, rng = None, None
+    else:
+        on_cuda = device.type == "cuda"
+        prefetch = on_cuda if use_prefetch is None else use_prefetch
+        pf = BatchPrefetcher(cfg, seed) if prefetch else None
+        source = pf
+        rng = None if prefetch else np.random.default_rng(seed)
+
+    t0 = time.time()
+    for step in range(total):
+        model.set_sigma(_sigma_at(step, total, cfg))
+        batch = source.get() if source is not None else build_batch(cfg, rng)
+
+        loss_parts = compute_losses(model, batch, device, sf)
+        loss = (float(lam["lambda_data"]) * loss_parts["data"]
+                + float(lam["lambda_pde"]) * loss_parts["pde"]
+                + float(lam["lambda_bc"]) * loss_parts["bc"])
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+
+        # non-finite-gradient guard (MPS / sharp source) — skip the step rather than poison weights
+        finite = all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+        if not finite:
+            opt.zero_grad(set_to_none=True)
+            if step % log_every == 0:
+                print(f"step {step}: non-finite grad — skipped")
+            continue
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        opt.step()
+        sched.step()
+
+        if step % log_every == 0 or step == total - 1:
+            rate = (step + 1) / (time.time() - t0)
+            print(f"step {step:6d}  loss={loss.item():.4e}  "
+                  f"data={loss_parts['data'].item():.3e} pde={loss_parts['pde'].item():.3e} "
+                  f"bc={loss_parts['bc'].item():.3e}  lr={sched.get_last_lr()[0]:.2e}  {rate:.1f} it/s")
+
+    if pf:
+        pf.close()
+    torch.save({"model": model.state_dict(), "cfg": cfg, "step": total}, checkpoint_path)
+    print(f"saved {checkpoint_path}")
+    return checkpoint_path
