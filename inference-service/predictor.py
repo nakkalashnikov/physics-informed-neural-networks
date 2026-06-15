@@ -65,6 +65,7 @@ def analytical_delta_T(
     intensity: float,
     x0: float,
     v: float,
+    a: float = 0.0,
     N_terms: int = 150,
 ) -> np.ndarray:
     """
@@ -73,24 +74,50 @@ def analytical_delta_T(
     ΔT(x,t) = (i·t)/(ρc·l)  +  Σ_{n≥1} aₙ(t)·cos(nπx/l)
 
     aₙ(t) = (2i/ρcl) · e^{−μₙt} · Iₙ(t)
-    Iₙ(t) = [e^{μₙτ}(μₙcos(bτ+c)+b·sin(bτ+c))/(μₙ²+b²)]₀ᵗ
+    Iₙ(t) = ∫₀ᵗ exp(μₙτ) cos(nπ(x₀+vτ+½aτ²)/l) dτ
+
+    When a == 0: closed-form (fast).
+    When a != 0: scipy.integrate.quad per n term (~0.1 s for single snapshot;
+    heatmap grids will be slower — acceptable for non-latency-critical use).
     """
     i_eff = intensity / rho_c
 
     delta_T = np.full_like(x, i_eff * t / l, dtype=np.float64)
 
+    use_quad = (a != 0.0)
+    if use_quad:
+        try:
+            from scipy.integrate import quad as _quad
+        except ImportError:
+            import warnings
+            warnings.warn(
+                "scipy not available — falling back to a=0 analytical path.",
+                RuntimeWarning, stacklevel=2,
+            )
+            use_quad = False
+
     for n in range(1, N_terms + 1):
         mu_n  = alpha * (n * math.pi / l) ** 2
-        b     = n * math.pi * v / l
-        c     = n * math.pi * x0 / l
-        denom = mu_n ** 2 + b ** 2
 
         if mu_n * t > 690.0:
             break
 
-        f_t = mu_n * math.cos(b * t + c) + b * math.sin(b * t + c)
-        f_0 = mu_n * math.cos(c)         + b * math.sin(c)
-        a_n = (2.0 * i_eff / l) * (f_t - math.exp(-mu_n * t) * f_0) / denom
+        if use_quad:
+            phase_scale = n * math.pi / l
+            def _integrand(tau, _mu=mu_n, _ps=phase_scale):
+                return math.exp(_mu * tau) * math.cos(
+                    _ps * (x0 + v * tau + 0.5 * a * tau ** 2)
+                )
+            I_n, _ = _quad(_integrand, 0.0, t, limit=200)
+            a_n = (2.0 * i_eff / l) * math.exp(-mu_n * t) * I_n
+        else:
+            b     = n * math.pi * v / l
+            c     = n * math.pi * x0 / l
+            denom = mu_n ** 2 + b ** 2
+            f_t   = mu_n * math.cos(b * t + c) + b * math.sin(b * t + c)
+            f_0   = mu_n * math.cos(c)         + b * math.sin(c)
+            a_n   = (2.0 * i_eff / l) * (f_t - math.exp(-mu_n * t) * f_0) / denom
+
         delta_T = delta_T + a_n * np.cos(n * math.pi * x / l)
 
     return delta_T
@@ -128,28 +155,31 @@ class Predictor:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _pi_groups(
-        self, alpha: float, l: float, i_eff: float, x0: float, v: float, t_total: float
-    ) -> tuple[float, float, float, float]:
-        """Physical params → (Fo, x0_norm, beta, T_c) — see sampler.compute_pi_groups."""
+        self, alpha: float, l: float, i_eff: float, x0: float, v: float, a: float,
+        t_total: float,
+    ) -> tuple[float, float, float, float, float]:
+        """Physical params → (Fo, x0_norm, beta, gamma, T_c) — see sampler.compute_pi_groups."""
         Fo      = alpha * t_total / (l ** 2)
         x0_norm = x0 / l
         beta    = v * t_total / l
+        gamma   = a * t_total ** 2 / l
         T_c     = i_eff * t_total / l
-        return Fo, x0_norm, beta, T_c
+        return Fo, x0_norm, beta, gamma, T_c
 
     def _build_pi_norm(
-        self, Fo: float, x0_norm: float, beta: float, n: int
+        self, Fo: float, x0_norm: float, beta: float, gamma: float, n: int
     ) -> torch.Tensor:
-        """Build (n, 3) normalised π-group tensor [Fo_n, x0_n, β_n]."""
+        """Build (n, 4) normalised π-group tensor [Fo_n, x0_n, β_n, γ_n]."""
         dev = self.device
 
         def full(val: float) -> torch.Tensor:
             return torch.full((n,), val, dtype=torch.float32, device=dev)
 
-        fo_n   = self.normalizer.norm_log(full(Fo),      "Fo")
-        x0_n   = self.normalizer.norm(    full(x0_norm), "x0_frac")
-        beta_n = self.normalizer.norm(    full(beta),    "beta")
-        return torch.stack([fo_n, x0_n, beta_n], dim=1)
+        fo_n    = self.normalizer.norm_log(full(Fo),      "Fo")
+        x0_n    = self.normalizer.norm(    full(x0_norm), "x0_frac")
+        beta_n  = self.normalizer.norm(    full(beta),    "beta")
+        gamma_n = self.normalizer.norm(    full(gamma),   "gamma")
+        return torch.stack([fo_n, x0_n, beta_n, gamma_n], dim=1)
 
     def _coords_norm(
         self, x_phys: np.ndarray, t_phys: float, l: float, t_total: float
@@ -171,6 +201,7 @@ class Predictor:
         t_total: float,
         x_query: float,
         t_query: float,
+        acceleration: float = 0.0,
     ) -> dict:
         """Single-point temperature prediction + analytical reference."""
         mat    = MATERIALS[material]
@@ -178,9 +209,11 @@ class Predictor:
         rho_c  = mat["rho_c"]
         i_eff  = intensity / rho_c
 
-        Fo, x0_norm, beta, T_c = self._pi_groups(alpha, length, i_eff, x0, velocity, t_total)
+        Fo, x0_norm, beta, gamma, T_c = self._pi_groups(
+            alpha, length, i_eff, x0, velocity, acceleration, t_total
+        )
         coords = self._coords_norm(np.array([x_query]), t_query, length, t_total)
-        pi     = self._build_pi_norm(Fo, x0_norm, beta, 1)
+        pi     = self._build_pi_norm(Fo, x0_norm, beta, gamma, 1)
 
         # Network outputs dimensionless u; rescale to physical ΔT.
         dT_pinn = float(self.model(coords, pi).item()) * T_c
@@ -188,7 +221,7 @@ class Predictor:
         dT_ref = float(
             analytical_delta_T(
                 np.array([x_query]), t_query,
-                alpha, rho_c, length, intensity, x0, velocity,
+                alpha, rho_c, length, intensity, x0, velocity, a=acceleration,
             )[0]
         )
 
@@ -216,30 +249,35 @@ class Predictor:
         t_total: float,
         nx: int = 60,
         nt: int = 60,
+        acceleration: float = 0.0,
     ) -> dict:
         """
         Evaluate PINN + analytical on an (nt × nx) grid.
         Returns data ready for JSON serialisation.
+        Note: when acceleration != 0 the analytical solution uses scipy.integrate.quad
+        per Fourier term per time row — expect ~15 s for a 60×60 grid.
         """
         mat   = MATERIALS[material]
         alpha = mat["alpha"]
         rho_c = mat["rho_c"]
         i_eff = intensity / rho_c
 
-        Fo, x0_norm, beta, T_c = self._pi_groups(alpha, length, i_eff, x0, velocity, t_total)
+        Fo, x0_norm, beta, gamma, T_c = self._pi_groups(
+            alpha, length, i_eff, x0, velocity, acceleration, t_total
+        )
 
         x_phys = np.linspace(0.0, length,  nx)   # (nx,)
         t_phys = np.linspace(0.0, t_total, nt)   # (nt,)
 
-        # Build flattened grid: (nt*nx, 2) coords and (nt*nx, 3) π-groups
+        # Build flattened grid: (nt*nx, 2) coords and (nt*nx, 4) π-groups
         x_grid, t_grid = np.meshgrid(x_phys, t_phys)   # both (nt, nx)
         x_flat = x_grid.ravel()                          # (nt*nx,)
         t_flat = t_grid.ravel()
 
         x_n = torch.tensor(x_flat / length,  dtype=torch.float32, device=self.device)
         t_n = torch.tensor(t_flat / t_total, dtype=torch.float32, device=self.device)
-        coords = torch.stack([x_n, t_n], dim=1)                    # (N, 2)
-        pi     = self._build_pi_norm(Fo, x0_norm, beta, len(x_flat))
+        coords = torch.stack([x_n, t_n], dim=1)                              # (N, 2)
+        pi     = self._build_pi_norm(Fo, x0_norm, beta, gamma, len(x_flat))  # (N, 4)
 
         # Network outputs dimensionless u; rescale to physical ΔT.
         dT_pinn_flat = self.model(coords, pi).squeeze().cpu().numpy() * T_c
@@ -251,10 +289,14 @@ class Predictor:
             if t_val == 0.0:
                 continue   # IC: ΔT = 0 everywhere
             dT_ref[i] = analytical_delta_T(
-                x_phys, t_val, alpha, rho_c, length, intensity, x0, velocity
+                x_phys, t_val, alpha, rho_c, length, intensity, x0, velocity,
+                a=acceleration,
             )
 
-        burner_pos = [min(x0 + velocity * t, length) for t in t_phys.tolist()]
+        burner_pos = [
+            float(np.clip(x0 + velocity * t + 0.5 * acceleration * t ** 2, 0.0, length))
+            for t in t_phys.tolist()
+        ]
 
         return {
             "x_grid":             x_phys.tolist(),

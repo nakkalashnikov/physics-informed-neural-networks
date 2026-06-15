@@ -47,8 +47,8 @@ SIGMA_NORM = 1.0 / 50.0
 def pde_loss(
     model: nn.Module,
     coords_norm: torch.Tensor,   # (N, 2)  dimensionless [x*, t*] ∈ [0,1]
-    pi_norm: torch.Tensor,       # (N, 3)  normalised π-groups [Fo_n, x0_n, β_n]
-    raw: dict,                   # raw π-values per point: {Fo, x0_norm, beta}, each (N,)
+    pi_norm: torch.Tensor,       # (N, 4)  normalised π-groups [Fo_n, x0_n, β_n, γ_n]
+    raw: dict,                   # raw π-values per point: {Fo, x0_norm, beta, gamma}, each (N,)
     epsilon: float = 1.0,        # causal weight strength ε (Wang et al. 2022)
     n_bins: int = 10,            # time windows for causal weighting
 ) -> torch.Tensor:
@@ -58,7 +58,8 @@ def pde_loss(
         u_t* = Fo · u_x*x*  +  S(x*, t*)
 
     where u = ΔT / T_c, x* = x/l, t* = t/t_total, Fo = α·t_total/l², and the
-    source S = δ_gauss(x*; x_b*, σ*) with x_b* = x0_norm + β·t* and σ* = 1/50.
+    source S = δ_gauss(x*; x_b*, σ*) with
+        x_b* = x0_norm + β·t* + ½γ·t*²   and   σ* = 1/50.
     Because S has a parameter-independent peak (≈ 19.95), the residual is O(1)
     for every parameter set and the loss weights all of them equally.
 
@@ -82,10 +83,11 @@ def pde_loss(
     Fo      = raw["Fo"].unsqueeze(1)
     x0_norm = raw["x0_norm"].unsqueeze(1)
     beta    = raw["beta"].unsqueeze(1)
+    gamma   = raw["gamma"].unsqueeze(1)
 
     x_norm = coords[:, 0:1]
     t_norm = coords[:, 1:2]
-    x_b    = x0_norm + beta * t_norm                       # burner position in x*
+    x_b    = (x0_norm + beta * t_norm + 0.5 * gamma * t_norm ** 2).clamp(0.0, 1.0)
     S      = _gaussian_delta(x_norm, x_b, SIGMA_NORM)      # dimensionless source
 
     residual = u_tn - Fo * u_xnxn - S              # (N, 1)
@@ -161,8 +163,8 @@ def bc_loss(
 def pde_residuals_fd(
     model: nn.Module,
     coords_norm: torch.Tensor,   # (N, 2)  [x*, t*]
-    pi_norm: torch.Tensor,       # (N, 3)  [Fo_n, x0_n, β_n]
-    raw: dict,                   # {Fo, x0_norm, beta}, each (N,)
+    pi_norm: torch.Tensor,       # (N, 4)  [Fo_n, x0_n, β_n, γ_n]
+    raw: dict,                   # {Fo, x0_norm, beta, gamma}, each (N,)
     eps_x: float = 1e-3,
     eps_t: float = 1e-4,
 ) -> torch.Tensor:
@@ -182,6 +184,7 @@ def pde_residuals_fd(
         Fo      = raw["Fo"].unsqueeze(1)
         x0_norm = raw["x0_norm"].unsqueeze(1)
         beta    = raw["beta"].unsqueeze(1)
+        gamma   = raw["gamma"].unsqueeze(1)
 
         c_xp = coords_norm.clone(); c_xp[:, 0] = (c_xp[:, 0] + eps_x).clamp(0.0, 1.0)
         c_xm = coords_norm.clone(); c_xm[:, 0] = (c_xm[:, 0] - eps_x).clamp(0.0, 1.0)
@@ -197,7 +200,7 @@ def pde_residuals_fd(
 
         x_norm = coords_norm[:, 0:1]
         t_norm = coords_norm[:, 1:2]
-        x_b    = x0_norm + beta * t_norm
+        x_b    = (x0_norm + beta * t_norm + 0.5 * gamma * t_norm ** 2).clamp(0.0, 1.0)
         S      = _gaussian_delta(x_norm, x_b, SIGMA_NORM)
 
         residual = (u_t - Fo * u_xx - S).squeeze(1)
@@ -259,6 +262,7 @@ def analytical_delta_T(
     intensity: float,
     x0: float,
     v: float,
+    a: float = 0.0,
     N_terms: int = 150,
 ) -> np.ndarray:
     """
@@ -272,31 +276,53 @@ def analytical_delta_T(
     where:
         aₙ(t) = (2i/ρcl) · exp(−μₙt) · Iₙ(t)
         μₙ    = α(nπ/l)²
-        Iₙ(t) = ∫₀ᵗ exp(μₙτ) cos(nπ(x₀+vτ)/l) dτ
+        Iₙ(t) = ∫₀ᵗ exp(μₙτ) cos(nπ(x₀ + vτ + ½aτ²)/l) dτ
 
-    The integral Iₙ(t) is evaluated analytically:
-        ∫ exp(aτ)·cos(bτ+c) dτ
-            = exp(aτ)·(a·cos(bτ+c) + b·sin(bτ+c)) / (a²+b²)
-
-    with  a = μₙ,  b = nπv/l,  c = nπx₀/l.
+    When a == 0 the integral has a closed form (fast path, unchanged).
+    When a != 0 it is computed via scipy.integrate.quad (~0.1 s for 8 validation
+    sets; heatmap inference will be slower — acceptable for non-latency-critical use).
     """
     i_eff = intensity / rho_c   # [K·m/s]
 
     # n=0: uniform temperature rise (total energy conservation)
     delta_T = np.full_like(x, i_eff * t / l, dtype=np.float64)
 
+    use_quad = (a != 0.0)
+    if use_quad:
+        try:
+            from scipy.integrate import quad as _quad
+        except ImportError:
+            import warnings
+            warnings.warn(
+                "scipy not available — falling back to a=0 analytical path. "
+                "Install scipy for accurate accelerated-burner validation.",
+                RuntimeWarning, stacklevel=2,
+            )
+            use_quad = False
+
     for n in range(1, N_terms + 1):
         mu_n  = alpha * (n * math.pi / l) ** 2
-        b     = n * math.pi * v / l
-        c     = n * math.pi * x0 / l
-        denom = mu_n ** 2 + b ** 2
 
         if mu_n * t > 690.0:
             break
 
-        f_t = mu_n * math.cos(b * t + c) + b * math.sin(b * t + c)
-        f_0 = mu_n * math.cos(c)         + b * math.sin(c)
-        a_n = (2.0 * i_eff / l) * (f_t - math.exp(-mu_n * t) * f_0) / denom
+        if use_quad:
+            phase_scale = n * math.pi / l
+            # Capture loop variable n by value via default arg
+            def _integrand(tau, _mu=mu_n, _ps=phase_scale):
+                return math.exp(_mu * tau) * math.cos(
+                    _ps * (x0 + v * tau + 0.5 * a * tau ** 2)
+                )
+            I_n, _ = _quad(_integrand, 0.0, t, limit=200)
+            a_n = (2.0 * i_eff / l) * math.exp(-mu_n * t) * I_n
+        else:
+            b     = n * math.pi * v / l
+            c     = n * math.pi * x0 / l
+            denom = mu_n ** 2 + b ** 2
+            f_t   = mu_n * math.cos(b * t + c) + b * math.sin(b * t + c)
+            f_0   = mu_n * math.cos(c)         + b * math.sin(c)
+            a_n   = (2.0 * i_eff / l) * (f_t - math.exp(-mu_n * t) * f_0) / denom
+
         delta_T = delta_T + a_n * np.cos(n * math.pi * x / l)
 
     return delta_T

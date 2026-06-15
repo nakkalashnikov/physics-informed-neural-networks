@@ -109,6 +109,7 @@ def validate(
             intens = raw["intensity"][k].item()
             x0     = raw["x0"][k].item()
             v      = raw["v"][k].item()
+            a      = raw["a"][k].item()
             t_tot  = raw["t_total"][k].item()
 
             t_q    = t_tot * 0.7
@@ -116,14 +117,16 @@ def validate(
             x_norm = torch.tensor(x_pts_norm, dtype=dtype, device=device)
             coords = torch.stack([x_norm, t_norm], dim=1)
 
-            # Network input: the three normalised π-groups for this parameter set.
-            fo_n   = normalizer.norm_log(
+            # Network input: the four normalised π-groups for this parameter set.
+            fo_n    = normalizer.norm_log(
                 torch.full((n,), pi["Fo"][k].item(),      device=device, dtype=dtype), "Fo")
-            x0_n   = normalizer.norm(
+            x0_n    = normalizer.norm(
                 torch.full((n,), pi["x0_norm"][k].item(), device=device, dtype=dtype), "x0_frac")
-            beta_n = normalizer.norm(
+            beta_n  = normalizer.norm(
                 torch.full((n,), pi["beta"][k].item(),    device=device, dtype=dtype), "beta")
-            pi_norm = torch.stack([fo_n, x0_n, beta_n], dim=1)
+            gamma_n = normalizer.norm(
+                torch.full((n,), pi["gamma"][k].item(),   device=device, dtype=dtype), "gamma")
+            pi_norm = torch.stack([fo_n, x0_n, beta_n, gamma_n], dim=1)
 
             # Network outputs dimensionless u; rescale to physical ΔT.
             T_c     = pi["T_c"][k].item()
@@ -131,7 +134,7 @@ def validate(
             dT_pred = T_c * u_pred
 
             x_phys = x_pts_norm * l
-            dT_ref = analytical_delta_T(x_phys, t_q, alpha, rho_c, l, intens, x0, v)
+            dT_ref = analytical_delta_T(x_phys, t_q, alpha, rho_c, l, intens, x0, v, a=a)
 
             rel_err = np.linalg.norm(dT_pred - dT_ref) / (np.linalg.norm(dT_ref) + 1e-8)
             errors.append(rel_err)

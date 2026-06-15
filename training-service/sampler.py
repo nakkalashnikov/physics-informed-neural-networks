@@ -2,7 +2,7 @@
 Physics-parameter sampling, dimensionless reduction, and collocation points.
 
 ── Dimensionless formulation (Buckingham-π) ──────────────────────────────────
-The physical problem has 5 free parameters (α, l, i_eff, x0, v) plus t_total.
+The physical problem has 5 free parameters (α, l, i_eff, x0, v, a) plus t_total.
 Non-dimensionalising with
 
     x* = x / l          t* = t / t_total          u = ΔT / T_c
@@ -12,24 +12,40 @@ collapses the PDE to
 
     u_t* = Fo · u_x*x*  +  S(x*, t*)
 
-which depends on exactly THREE dimensionless groups:
+which depends on exactly FOUR dimensionless groups:
 
     Fo       = α · t_total / l²        Fourier number (diffusion vs. time)
     x0_norm  = x0 / l                  burner start (fraction of length)
-    β        = v · t_total / l         burner travel (fraction of length)
+    β        = v · t_total / l         signed burner travel (fraction of length)
+    γ        = a · t_total² / l        dimensionless acceleration (curvature)
 
-The source S = δ_gauss(x*; x_b*, σ*) with σ* = 1/50 has a parameter-independent
-peak ≈ 19.95, so the residual is O(1) for every parameter set — the loss no
-longer ignores low-amplitude (small i_eff / large l) cases.
+The source S = δ_gauss(x*; x_b*, σ*) with σ* = 1/50 and
 
-The network input is therefore (x*, t*, Fo_n, x0_n, β_n) and it outputs the
+    x_b*(t*) = x0_norm + β·t* + ½γ·t*²
+
+has a parameter-independent peak ≈ 19.95, so the residual is O(1) for every
+parameter set — the loss no longer ignores low-amplitude (small i_eff / large l)
+cases.
+
+Trajectory sampling
+────────────────────
+β and γ are sampled directly in their constraint-derived bounds [-1, 1] and [-2, 2]
+(rather than from physical velocity/acceleration ranges) to guarantee uniform
+coverage of the dimensionless space. Physical v and a are back-computed from
+(β, γ, l, t_total) and are used only in the analytical reference solution.
+A rejection loop enforces x_b*(t*) ∈ [0, 1] for all t* ∈ [0, 1].
+
+The network input is therefore (x*, t*, Fo_n, x0_n, β_n, γ_n) and it outputs the
 dimensionless u.  The physical temperature is recovered as ΔT = T_c · u, applied
 by the caller (validation / inference), never inside the network.
 """
 
+import logging
 import math
 
 import torch
+
+log = logging.getLogger(__name__)
 
 
 # ── Normalizer ────────────────────────────────────────────────────────────────
@@ -39,6 +55,10 @@ class Normalizer:
     Linear normalisation of scalars to [0, 1], plus log-normalisation for the
     Fourier number (which spans ~4 orders of magnitude across the parameter
     space and would otherwise crush the small-Fo end toward 0).
+
+    β and γ bounds are hardcoded (constraint-derived), not read from config:
+      β ∈ [-1, 1]  — trajectory stays in pipe, |½γ| ≤ 1 at endpoint
+      γ ∈ [-2, 2]  — from endpoint constraint |½γ| ≤ 1 when |x0_norm+β| ≤ 1
     """
 
     def __init__(self, cfg: dict) -> None:
@@ -59,15 +79,15 @@ class Normalizer:
             "l":         tuple(p["length_range"]),
             "intensity": tuple(p["intensity_range"]),
             "x0_frac":   tuple(p["x0_fraction_range"]),
-            "v":         tuple(p["velocity_range"]),
             "t_total":   tuple(p["t_total_range"]),
             "i_eff": (
                 p["intensity_range"][0] / p["rho_c_range"][1],
                 p["intensity_range"][1] / p["rho_c_range"][0],
             ),
-            # ── Dimensionless π-groups (network inputs) ──
-            "Fo":   (fo_lo, fo_hi),   # log-normalised
-            "beta": (0.0, 1.0),       # β = v·t_total/l ∈ (0, 1) by the in-pipe constraint
+            # ── Dimensionless π-groups (network inputs) ──────────────────
+            "Fo":    (fo_lo, fo_hi),   # log-normalised
+            "beta":  (-1.0, 1.0),      # constraint-derived; sampled directly
+            "gamma": (-2.0, 2.0),      # constraint-derived; sampled directly
         }
 
     def norm(self, val: torch.Tensor, key: str) -> torch.Tensor:
@@ -87,12 +107,20 @@ class Normalizer:
 
 # ── Parameter sampling ────────────────────────────────────────────────────────
 
+_TRAJ_MAX_ITER = 20   # rejection loop iteration cap
+_TRAJ_N_CHECK  = 50   # t* grid points for trajectory constraint check
+
+
 def sample_params(n: int, cfg: dict, device: torch.device) -> dict[str, torch.Tensor]:
     """
-    Sample n physics-parameter sets uniformly on the GPU.
+    Sample n physics-parameter sets.
+
+    Trajectory (β, γ) is sampled in dimensionless space [-1, 1] × [-2, 2] with a
+    rejection loop that guarantees x_b*(t*) = x0_norm + β·t* + ½γ·t*² ∈ [0, 1]
+    for all t* ∈ [0, 1].  Physical v = β·l/t_total and a = γ·l/t_total² are
+    back-computed and used only in the analytical reference solution.
 
     Returns a dict of (n,) float32 tensors on `device`.
-    Velocity is constrained so x0 + v·t_total ≤ l (burner stays inside the pipe).
     """
     p = cfg["physics"]
 
@@ -111,13 +139,36 @@ def sample_params(n: int, cfg: dict, device: torch.device) -> dict[str, torch.Te
     t_lo, t_hi = p["t_total_range"]
     t_total = torch.rand(n, device=device) * (t_hi - t_lo) + t_lo
 
-    v_lo = torch.full((n,), p["velocity_range"][0], device=device)
-    v_hi = torch.clamp(
-        (l - x0) / t_total,
-        min=p["velocity_range"][0],
-        max=p["velocity_range"][1],
-    )
-    v = torch.rand(n, device=device) * (v_hi - v_lo) + v_lo
+    x0_norm = x0 / l   # (n,) — needed for trajectory check
+
+    # ── Sample trajectory in dimensionless space ──────────────────────────
+    beta  = torch.rand(n, device=device) * 2.0 - 1.0   # uniform [-1, 1]
+    gamma = torch.rand(n, device=device) * 4.0 - 2.0   # uniform [-2, 2]
+
+    # Rejection loop: x_b*(t*) = x0_norm + β·t* + ½γ·t*² must stay in [0, 1]
+    t_pts = torch.linspace(0.0, 1.0, _TRAJ_N_CHECK, device=device)   # (50,)
+    for _iter in range(_TRAJ_MAX_ITER):
+        # x_b: (n, 50)
+        x_b = (x0_norm.unsqueeze(1)
+               + beta.unsqueeze(1)  * t_pts
+               + 0.5 * gamma.unsqueeze(1) * t_pts ** 2)
+        valid = (x_b >= 0.0).all(dim=1) & (x_b <= 1.0).all(dim=1)   # (n,)
+        if valid.all():
+            break
+        inv = ~valid
+        n_inv = int(inv.sum().item())
+        if _iter == _TRAJ_MAX_ITER - 1:
+            log.warning(
+                "Trajectory constraint: %d/%d rows still invalid after %d iters "
+                "(clamping will act as safety net)",
+                n_inv, n, _TRAJ_MAX_ITER,
+            )
+        beta[inv]  = torch.rand(n_inv, device=device) * 2.0 - 1.0
+        gamma[inv] = torch.rand(n_inv, device=device) * 4.0 - 2.0
+
+    # Back-compute physical v and a for use in analytical_delta_T
+    v = beta  * l / t_total
+    a = gamma * l / t_total ** 2
 
     i_eff = intensity / rho_c   # [K·m/s]
 
@@ -128,6 +179,7 @@ def sample_params(n: int, cfg: dict, device: torch.device) -> dict[str, torch.Te
         "intensity": intensity,
         "x0":        x0,
         "v":         v,
+        "a":         a,
         "t_total":   t_total,
         "i_eff":     i_eff,
     }
@@ -140,16 +192,18 @@ def compute_pi_groups(raw: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     Map physical parameters → dimensionless π-groups and the temperature scale.
 
     Returns (each same shape as the inputs):
-        Fo       = α·t_total/l²       diffusion number
-        x0_norm  = x0/l               burner start fraction
-        beta     = v·t_total/l        burner travel fraction
-        T_c      = i_eff·t_total/l    characteristic ΔT  (output rescale factor)
+        Fo       = α·t_total/l²        diffusion number
+        x0_norm  = x0/l                burner start fraction
+        beta     = v·t_total/l         signed burner travel fraction
+        gamma    = a·t_total²/l        dimensionless acceleration
+        T_c      = i_eff·t_total/l     characteristic ΔT  (output rescale factor)
     """
     l = raw["l"]
     return {
         "Fo":      raw["alpha"] * raw["t_total"] / (l ** 2),
         "x0_norm": raw["x0"] / l,
         "beta":    raw["v"] * raw["t_total"] / l,
+        "gamma":   raw["a"] * raw["t_total"] ** 2 / l,
         "T_c":     raw["i_eff"] * raw["t_total"] / l,
     }
 
@@ -167,13 +221,14 @@ def _pi_norm_for_set(
     n_pts: int,
 ) -> torch.Tensor:
     """
-    Build a (n_pts, 3) normalised π-group tensor for one parameter set.
-    Column order: [Fo_n, x0_n, β_n].
+    Build a (n_pts, 4) normalised π-group tensor for one parameter set.
+    Column order: [Fo_n, x0_n, β_n, γ_n].
     """
-    fo_n   = normalizer.norm_log(_to_column(pi_k["Fo"],      n_pts), "Fo")
-    x0_n   = normalizer.norm(    _to_column(pi_k["x0_norm"], n_pts), "x0_frac")
-    beta_n = normalizer.norm(    _to_column(pi_k["beta"],    n_pts), "beta")
-    return torch.stack([fo_n, x0_n, beta_n], dim=1)
+    fo_n    = normalizer.norm_log(_to_column(pi_k["Fo"],      n_pts), "Fo")
+    x0_n    = normalizer.norm(    _to_column(pi_k["x0_norm"], n_pts), "x0_frac")
+    beta_n  = normalizer.norm(    _to_column(pi_k["beta"],    n_pts), "beta")
+    gamma_n = normalizer.norm(    _to_column(pi_k["gamma"],   n_pts), "gamma")
+    return torch.stack([fo_n, x0_n, beta_n, gamma_n], dim=1)
 
 
 def rad_resample_pde(
@@ -191,7 +246,7 @@ def rad_resample_pde(
          the moving heat source automatically.
 
     Returns (coords_pde, pi_pde, raw_pde) — same format as build_batch's PDE
-    tuple, where raw_pde holds the raw π-values (Fo, x0_norm, beta) per point.
+    tuple, where raw_pde holds the raw π-values (Fo, x0_norm, beta, gamma) per point.
     """
     from physics import pde_residuals_fd
 
@@ -206,7 +261,7 @@ def rad_resample_pde(
     pi_sets  = compute_pi_groups(raw_sets)
     dtype    = next(model.parameters()).dtype
 
-    raw_keys = ("Fo", "x0_norm", "beta")
+    raw_keys = ("Fo", "x0_norm", "beta", "gamma")
     coords_out, pi_out = [], []
     raw_acc: dict[str, list[torch.Tensor]] = {k: [] for k in raw_keys}
 
@@ -252,8 +307,8 @@ def build_batch(
     )
 
     coords_* : (N, 2)  – [x*, t*] ∈ [0, 1]
-    pi_*     : (N, 3)  – normalised [Fo_n, x0_n, β_n]
-    raw_pde  : dict of (N_pde,) tensors – raw π-values {Fo, x0_norm, beta}
+    pi_*     : (N, 4)  – normalised [Fo_n, x0_n, β_n, γ_n]
+    raw_pde  : dict of (N_pde,) tensors – raw π-values {Fo, x0_norm, beta, gamma}
 
     pde_override : if provided (from rad_resample_pde), skip PDE point generation
                    and use it instead. BC/IC are always freshly sampled.
@@ -270,7 +325,7 @@ def build_batch(
     coords_bc, pi_bc = [], []
     coords_ic, pi_ic = [], []
 
-    raw_keys = ("Fo", "x0_norm", "beta")
+    raw_keys = ("Fo", "x0_norm", "beta", "gamma")
     if pde_override is None:
         n_pde   = cfg["sampling"]["n_pde"]
         pps_pde = n_pde // n_p
@@ -290,7 +345,9 @@ def build_batch(
 
             tn_burner = torch.rand(n_burner, device=device)
             sigma_n   = 1.0 / 20.0
-            x_b_norm  = pi_k["x0_norm"] + pi_k["beta"] * tn_burner   # burner pos in x*
+            x_b_norm  = (pi_k["x0_norm"]
+                         + pi_k["beta"]  * tn_burner
+                         + 0.5 * pi_k["gamma"] * tn_burner ** 2)
             xn_burner = (x_b_norm + torch.randn(n_burner, device=device) * sigma_n
                          ).clamp(0.0, 1.0)
 

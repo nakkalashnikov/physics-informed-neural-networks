@@ -15,12 +15,15 @@ physics:
   # Burner intensity  [W/m]
   intensity_range: [500.0, 10000.0]
 
-  # Burner start position as fraction of pipe length ∈ [0, 1)
-  x0_fraction_range: [0.0, 0.3]
+  # Burner start position as fraction of pipe length ∈ [0, 1]
+  x0_fraction_range: [0.0, 1.0]
 
-  # Burner velocity  [m/s]
-  # Sampling is constrained so x0 + v·t_total ≤ l (stays inside pipe)
-  velocity_range:  [0.005, 0.3]
+  # Burner trajectory — sampled in dimensionless space for uniform (β, γ) coverage:
+  #   β = v·t_total/l  ∈ [-1,  1]   signed; negative = right-to-left, 0 = stationary
+  #   γ = a·t_total²/l ∈ [-2,  2]   curvature: deceleration, reversal, acceleration
+  # A rejection loop enforces x_b*(t*) = x0_norm + β·t* + ½γ·t*² ∈ [0,1] for all t*.
+  # Physical v and a are back-computed for the analytical reference solution only.
+  # Bounds live in sampler.Normalizer; no velocity_range / acceleration_range needed.
 
   # Total simulation time  [s]
   t_total_range:   [10.0, 60.0]

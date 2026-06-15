@@ -68,10 +68,10 @@ torch.manual_seed(0)
 raw = sample_params(args.n, cfg, device)
 pi  = compute_pi_groups(raw)
 
-print(f"\n{'─'*70}")
-print(f"{'Set':>3}  {'α':>10}  {'l':>5}  {'i_eff':>9}  {'v':>6}  "
+print(f"\n{'─'*82}")
+print(f"{'Set':>3}  {'α':>10}  {'l':>5}  {'i_eff':>9}  {'v':>7}  {'a':>8}  "
       f"{'t_tot':>6}  {'RelErr':>8}")
-print(f"{'─'*70}")
+print(f"{'─'*82}")
 
 all_errors = []
 results = []
@@ -86,6 +86,7 @@ with torch.no_grad():
         intens = raw["intensity"][k].item()
         x0     = raw["x0"][k].item()
         v      = raw["v"][k].item()
+        a      = raw["a"][k].item()
         t_tot  = raw["t_total"][k].item()
         i_eff  = raw["i_eff"][k].item()
 
@@ -100,22 +101,23 @@ with torch.no_grad():
         fo_n    = normalizer.norm_log(torch.full((n,), pi["Fo"][k].item()),      "Fo")
         x0_n    = normalizer.norm(    torch.full((n,), pi["x0_norm"][k].item()), "x0_frac")
         beta_n  = normalizer.norm(    torch.full((n,), pi["beta"][k].item()),    "beta")
-        pi_norm = torch.stack([fo_n, x0_n, beta_n], dim=1)
+        gamma_n = normalizer.norm(    torch.full((n,), pi["gamma"][k].item()),   "gamma")
+        pi_norm = torch.stack([fo_n, x0_n, beta_n, gamma_n], dim=1)
 
         T_c     = pi["T_c"][k].item()
         dT_pred = model(coords, pi_norm).squeeze().numpy() * T_c
 
         x_phys  = x_pts * l
-        dT_ref  = analytical_delta_T(x_phys, t_q, alpha, rho_c, l, intens, x0, v)
+        dT_ref  = analytical_delta_T(x_phys, t_q, alpha, rho_c, l, intens, x0, v, a=a)
 
         rel_err = np.linalg.norm(dT_pred - dT_ref) / (np.linalg.norm(dT_ref) + 1e-8)
         all_errors.append(rel_err)
         results.append((x_pts * l, dT_pred, dT_ref, rel_err, k))
 
-        print(f"{k:>3}  {alpha:>10.2e}  {l:>5.2f}  {i_eff:>9.4f}  {v:>6.4f}  "
+        print(f"{k:>3}  {alpha:>10.2e}  {l:>5.2f}  {i_eff:>9.4f}  {v:>+7.4f}  {a:>+8.5f}  "
               f"{t_tot:>6.1f}  {rel_err:>8.2%}")
 
-print(f"{'─'*70}")
+print(f"{'─'*82}")
 print(f"Mean relative L2 error: {np.mean(all_errors):.2%}")
 print(f"Best:  {min(all_errors):.2%}   Worst: {max(all_errors):.2%}")
 

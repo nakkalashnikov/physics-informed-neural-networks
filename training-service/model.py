@@ -111,7 +111,7 @@ class PINN(nn.Module):
     Input layout
     ─────────────
     coords_norm : (N, 2)  –  [x*, t*] ∈ [0, 1]
-    pi_norm     : (N, 3)  –  [Fo_n, x0_n, β_n] ∈ [0, 1]
+    pi_norm     : (N, 4)  –  [Fo_n, x0_n, β_n, γ_n] ∈ [0, 1]
 
     Output
     ──────
@@ -130,7 +130,7 @@ class PINN(nn.Module):
         super().__init__()
 
         self.fourier = FourierFeatures(d_in=2, m=fourier_m, sigma=fourier_sigma)
-        d_in_mlp = self.fourier.out_dim + 3   # 128 + 3 π-groups = 131
+        d_in_mlp = self.fourier.out_dim + 4   # 128 + 4 π-groups = 132
 
         # Shared encoders U and V — computed once per forward pass,
         # shared across all PirateBlocks
