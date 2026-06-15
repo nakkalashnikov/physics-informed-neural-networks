@@ -26,3 +26,9 @@ ui/.env.local
 training-service-2d/*.npz
 training-service-2d/*.pt
 training-service-2d/**/__pycache__/
+
+# Claude Code internals
+.claude/skills/
+
+# Inspection images
+*.png
