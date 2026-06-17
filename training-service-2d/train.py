@@ -18,6 +18,8 @@ def main() -> None:
     ap.add_argument("--no-prefetch", action="store_true")
     ap.add_argument("--cache", default=None, help="path to precomputed labels.npz (skips online Fourier)")
     ap.add_argument("--profile", action="store_true", help="print per-stage ms/step breakdown (get/fwd/bwd)")
+    ap.add_argument("--n-traj", type=int, default=None, help="override batch.n_traj_per_batch")
+    ap.add_argument("--n-int", type=int, default=None, help="override batch.n_interior")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -27,7 +29,8 @@ def main() -> None:
     print(f"device: {device}")
     train(cfg, device, total_steps=args.steps,
           use_prefetch=False if args.no_prefetch else None,
-          checkpoint_path=args.out, cache_path=args.cache, profile=args.profile)
+          checkpoint_path=args.out, cache_path=args.cache, profile=args.profile,
+          n_traj=args.n_traj, n_int=args.n_int)
 
 
 if __name__ == "__main__":

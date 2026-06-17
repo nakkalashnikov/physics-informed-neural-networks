@@ -92,11 +92,19 @@ def compute_losses(model, batch: Batch, device, sigma_factor: float) -> dict:
 def train(cfg: dict, device: torch.device, total_steps: int | None = None,
           use_prefetch: bool | None = None, log_every: int = 50,
           checkpoint_path: str = "checkpoint.pt", cache_path: str | None = None,
-          profile: bool = False) -> str:
+          profile: bool = False, n_traj: int | None = None, n_int: int | None = None) -> str:
     tr = cfg["training"]
     total = int(total_steps if total_steps is not None else tr["total_steps"])
     seed = int(tr["seed"])
     torch.manual_seed(seed)
+
+    # Batch-size overrides (throughput sweep): bigger batch amortizes per-step launch
+    # overhead (launch-bound small model) AND raises epochs/sec to fight undertraining.
+    if n_traj is not None:
+        cfg["batch"]["n_traj_per_batch"] = int(n_traj)
+    if n_int is not None:
+        cfg["batch"]["n_interior"] = int(n_int)
+    print(f"batch: n_traj={cfg['batch']['n_traj_per_batch']} n_int={cfg['batch']['n_interior']}")
 
     model = build_model(cfg).to(device)
     lam = cfg["loss"]
@@ -144,15 +152,16 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
         opt.zero_grad(set_to_none=True)
         loss.backward()
 
-        # non-finite-gradient guard (MPS / sharp source) — skip the step rather than poison weights
-        finite = all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
-        if not finite:
+        # non-finite-gradient guard: clip returns the total grad-norm (a fused reduction);
+        # if any grad is NaN/Inf the norm is non-finite. One check instead of a 40-tensor
+        # Python loop with a sync per param (which dominated the launch-bound step overhead).
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        if not torch.isfinite(total_norm):
             opt.zero_grad(set_to_none=True)
             if step % log_every == 0:
                 print(f"step {step}: non-finite grad — skipped")
             continue
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         opt.step()
         sched.step()
         _sync(); _p3 = time.perf_counter()
