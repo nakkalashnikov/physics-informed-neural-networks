@@ -15,7 +15,7 @@ import time
 
 import torch
 
-from data import Batch, BatchPrefetcher, CachedBatcher, build_batch
+from data import Batch, BatchPrefetcher, CachedBatcher, SourcePrefetcher, build_batch
 from model import build_model
 from physics import bc_flux_residual, bc_insulation_residual, pde_residual
 
@@ -107,8 +107,12 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
 
     import numpy as np
     if cache_path is not None:                       # cached labels -> cheap on-the-fly batches
-        source = CachedBatcher(cfg, seed, path=cache_path)
-        pf, rng = None, None
+        base = CachedBatcher(cfg, seed, path=cache_path)
+        on_cuda = device.type == "cuda"
+        prefetch = on_cuda if use_prefetch is None else use_prefetch
+        pf = SourcePrefetcher(base) if prefetch else None   # overlap CPU build w/ GPU
+        source = pf if prefetch else base
+        rng = None
     else:
         on_cuda = device.type == "cuda"
         prefetch = on_cuda if use_prefetch is None else use_prefetch

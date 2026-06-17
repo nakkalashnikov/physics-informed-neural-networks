@@ -220,6 +220,35 @@ class CachedBatcher:
         return Batch(**cat)
 
 
+class SourcePrefetcher:
+    """Wrap any object with .get() in a background thread, overlapping its (CPU) work
+    with GPU compute. Used to un-starve the cache path (CachedBatcher.get() does numpy
+    tile/full/concatenate + CubicSpline serially on the main thread otherwise).
+
+    Single worker thread → the wrapped source's RNG is consumed in a deterministic order.
+    """
+
+    def __init__(self, source, queue_size: int = 4):
+        self._source = source
+        self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(self._source.get(), timeout=1.0)
+            except queue.Full:
+                continue
+
+    def get(self) -> Batch:
+        return self._queue.get()
+
+    def close(self) -> None:
+        self._stop.set()
+
+
 class BatchPrefetcher:
     """Background thread that builds batches into a queue (numpy only; safe off-main-thread)."""
 
