@@ -49,6 +49,11 @@ batch:
   n_bc0: 256            # flux boundary y*=0
   n_bc_ins: 256         # other (insulated) edges
   n_data: 512           # Fourier label points
+  # Source-concentrated collocation sampling (interior + bc0): this fraction of points is drawn
+  # near the moving source center xb*(t*) ~ N(c, (band*sigma_star)^2), the rest uniform. Fixes the
+  # plateau where uniform sampling never sees the razor-thin Gaussian (sigma_star=w/6 ~ 0.003).
+  source_frac: 0.5
+  source_band_sigmas: 3.0
 
 training:
   optimizer: adam

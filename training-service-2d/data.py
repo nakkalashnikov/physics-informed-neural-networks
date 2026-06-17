@@ -64,6 +64,20 @@ def _branch_vector(traj_fn, pi: PiGroups, cfg: dict) -> np.ndarray:
     return np.concatenate([samples, pi_n]).astype(np.float64)
 
 
+def _mix_x(n: int, n_src: int, center_fn, sigma_star: float, band: float,
+           rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """x* and shared t* columns for a physics group, with n_src points concentrated near
+    the moving source. Source points: x* ~ N(center(t*), (band*sigma_star)^2) clipped to [0,1];
+    the rest stay uniform so the cold domain is covered. The same t* is returned so bc0_xb can
+    reference the identical per-point center (see spec: center agreement)."""
+    t = rng.random(n)
+    x = rng.random(n)
+    if n_src > 0:
+        c = np.asarray(center_fn(t[:n_src])).reshape(-1)        # per-point center (source moves)
+        x[:n_src] = np.clip(c + rng.normal(0.0, band * sigma_star, n_src), 0.0, 1.0)
+    return x, t
+
+
 def build_batch(cfg: dict, rng: np.random.Generator) -> Batch:
     n_traj = int(cfg["batch"]["n_traj_per_batch"])
     n_int = int(cfg["batch"]["n_interior"])
@@ -71,6 +85,8 @@ def build_batch(cfg: dict, rng: np.random.Generator) -> Batch:
     n_ins = int(cfg["batch"]["n_bc_ins"])
     n_data = int(cfg["batch"]["n_data"])
     sf = float(cfg["physics"]["sigma_factor"])
+    source_frac = float(cfg["batch"].get("source_frac", 0.0))
+    band = float(cfg["batch"].get("source_band_sigmas", 3.0))
 
     acc: dict[str, list] = {k: [] for k in (
         "int_coords", "int_branch", "int_Fo", "int_AR",
@@ -91,19 +107,23 @@ def build_batch(cfg: dict, rng: np.random.Generator) -> Batch:
         def tile(n):  # repeat the branch vector across n points
             return np.tile(bvec, (n, 1))
 
-        # interior
-        ic = rng.random((n_int, 3))
+        sigma_star = pi.w / sf
+
+        # interior (x* concentrated near the moving source for source_frac of points)
+        ix, it = _mix_x(n_int, int(round(source_frac * n_int)), traj, sigma_star, band, rng)
+        ic = np.stack([ix, rng.random(n_int), it], axis=1)
         acc["int_coords"].append(ic)
         acc["int_branch"].append(tile(n_int))
         acc["int_Fo"].append(np.full((n_int, 1), pi.Fo))
         acc["int_AR"].append(np.full((n_int, 1), pi.AR))
 
-        # flux boundary yhat=0
-        bc0 = rng.random((n_bc0, 3)); bc0[:, 1] = 0.0
+        # flux boundary yhat=0 (same concentration; bc0_xb uses the shared per-point t*)
+        bx, bt = _mix_x(n_bc0, int(round(source_frac * n_bc0)), traj, sigma_star, band, rng)
+        bc0 = np.stack([bx, np.zeros(n_bc0), bt], axis=1)
         acc["bc0_coords"].append(bc0)
         acc["bc0_branch"].append(tile(n_bc0))
         acc["bc0_Q"].append(np.full((n_bc0, 1), pi.Q_star))
-        acc["bc0_xb"].append(traj(bc0[:, 2]).reshape(-1, 1))
+        acc["bc0_xb"].append(traj(bt).reshape(-1, 1))
         acc["bc0_w"].append(np.full((n_bc0, 1), pi.w))
 
         # insulated x-edges (half at x*=0, half at x*=1)
@@ -171,6 +191,9 @@ class CachedBatcher:
         n_insx = n_ins // 2
         n_insy = n_ins - n_insx
         nd_cache = self._du.shape[1]
+        sf = float(cfg["physics"]["sigma_factor"])
+        source_frac = float(cfg["batch"].get("source_frac", 0.0))
+        band = float(cfg["batch"].get("source_band_sigmas", 3.0))
 
         idxs = rng.integers(0, self._branch.shape[0], size=n_traj)
         acc: dict[str, list] = {k: [] for k in (
@@ -191,15 +214,19 @@ class CachedBatcher:
             def tile(n):
                 return np.tile(bvec, (n, 1))
 
-            ic = rng.random((n_int, 3))
+            sigma_star = w / sf
+
+            ix, it = _mix_x(n_int, int(round(source_frac * n_int)), spline, sigma_star, band, rng)
+            ic = np.stack([ix, rng.random(n_int), it], axis=1)
             acc["int_coords"].append(ic); acc["int_branch"].append(tile(n_int))
             acc["int_Fo"].append(np.full((n_int, 1), Fo)); acc["int_AR"].append(np.full((n_int, 1), AR))
             acc["int_scale"].append(np.full((n_int, 1), scale))
 
-            bc0 = rng.random((n_bc0, 3)); bc0[:, 1] = 0.0
+            bx, bt = _mix_x(n_bc0, int(round(source_frac * n_bc0)), spline, sigma_star, band, rng)
+            bc0 = np.stack([bx, np.zeros(n_bc0), bt], axis=1)
             acc["bc0_coords"].append(bc0); acc["bc0_branch"].append(tile(n_bc0))
             acc["bc0_Q"].append(np.full((n_bc0, 1), Q))
-            acc["bc0_xb"].append(spline(bc0[:, 2]).reshape(-1, 1))
+            acc["bc0_xb"].append(spline(bt).reshape(-1, 1))
             acc["bc0_w"].append(np.full((n_bc0, 1), w))
             acc["bc0_fluxscale"].append(np.full((n_bc0, 1), flux))
 
