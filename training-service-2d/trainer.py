@@ -143,9 +143,15 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
 
         if step % log_every == 0 or step == total - 1:
             rate = (step + 1) / (time.time() - t0)
-            print(f"step {step:6d}  loss={loss.item():.4e}  "
-                  f"data={loss_parts['data'].item():.3e} pde={loss_parts['pde'].item():.3e} "
-                  f"bc={loss_parts['bc'].item():.3e}  lr={sched.get_last_lr()[0]:.2e}  {rate:.1f} it/s")
+            # Loss components are mean-squared RELATIVE residuals; sqrt → RMS relative
+            # error, shown as a percentage so the numbers are readable at a glance
+            # (e.g. data 69% means the predicted field is ~69% off on average).
+            data_pct = 100.0 * loss_parts["data"].item() ** 0.5
+            pde_pct  = 100.0 * loss_parts["pde"].item() ** 0.5
+            bc_pct   = 100.0 * loss_parts["bc"].item() ** 0.5
+            print(f"step {step:6d} | "
+                  f"data {data_pct:5.1f}% | pde {pde_pct:5.1f}% | bc {bc_pct:5.1f}% | "
+                  f"loss {loss.item():.3e} | lr {sched.get_last_lr()[0]:.1e} | {rate:.1f} it/s")
 
     if pf:
         pf.close()
