@@ -168,7 +168,8 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
 
     t0 = time.time()
     for step in range(total):
-        model.set_sigma(_sigma_at(step, total, cfg))
+        sigma = _sigma_at(step, total, cfg)
+        model.set_sigma(sigma)
 
         _sync(); _p0 = time.perf_counter()
         batch = source.get() if source is not None else build_batch(cfg, rng)
@@ -202,10 +203,11 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
             with torch.no_grad():
                 sw = pi_table_sweep(model, cfg, device, n_cases=val_n)
             model.train()
-            model.set_sigma(_sigma_at(step, total, cfg))
+            model.set_sigma(sigma)
             elapsed_h = (time.time() - t0) / 3600
-            print(f"  ── VAL step {step:6d} │ L2 median={sw['median']:.1%}  "
-                  f"p90={sw['p90']:.1%}  max={sw['max']:.1%}  │ {elapsed_h:.2f}h elapsed")
+            print(f"  ══ VAL step {step:6d} ({100.0*(step+1)/total:.0f}%) │ σ {sigma:.2f} │ "
+                  f"L2 median {sw['median']:.1%}  p90 {sw['p90']:.1%}  max {sw['max']:.1%}  "
+                  f"│ {elapsed_h:.2f}h elapsed")
 
         if profile:
             prof["get"] += _p1 - _p0; prof["fwd"] += _p2 - _p1
@@ -213,15 +215,17 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
 
         if step % log_every == 0 or step == total - 1:
             rate = (step + 1) / (time.time() - t0)
+            eta_h = (total - step - 1) / max(rate, 1e-9) / 3600.0
+            prog = 100.0 * (step + 1) / total
             # Loss components are mean-squared RELATIVE residuals; sqrt → RMS relative
             # error, shown as a percentage so the numbers are readable at a glance
             # (e.g. data 69% means the predicted field is ~69% off on average).
             data_pct = 100.0 * loss_parts["data"].item() ** 0.5
             pde_pct  = 100.0 * loss_parts["pde"].item() ** 0.5
             bc_pct   = 100.0 * loss_parts["bc"].item() ** 0.5
-            print(f"step {step:6d} | "
-                  f"data {data_pct:5.1f}% | pde {pde_pct:5.1f}% | bc {bc_pct:5.1f}% | "
-                  f"loss {loss.item():.3e} | lr {sched.get_last_lr()[0]:.1e} | {rate:.1f} it/s")
+            print(f"step {step:6d} {prog:3.0f}% │ σ {sigma:.2f} │ "
+                  f"data {data_pct:5.1f}%  pde {pde_pct:6.1f}%  bc {bc_pct:5.1f}% │ "
+                  f"lr {sched.get_last_lr()[0]:.1e} │ {rate:.1f} it/s │ ETA {eta_h:4.1f}h")
 
             if profile and prof["n"] > 0:
                 n = prof["n"]
