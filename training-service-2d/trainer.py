@@ -11,6 +11,7 @@ Adam + cosine LR, RFF sigma curriculum, gradient-norm clipping, non-finite-gradi
 
 from __future__ import annotations
 
+import math
 import time
 
 import torch
@@ -39,9 +40,34 @@ def _t(arr, device, grad=False):
 
 
 def _sigma_at(step: int, total: int, cfg: dict) -> float:
+    # Ramp the RFF bandwidth to its target over the first `ramp_frac` of the run, then HOLD.
+    # A full-length linear ramp spends equal time at every bandwidth and only reaches the
+    # useful high-frequency band when the cosine LR has already decayed to ~0 — wasting most
+    # of the budget. Reaching sigma_end early (25%) leaves the bulk of steps at full resolution
+    # with a still-useful LR (Wang et al., JMLR 2024, frequency-progressive training).
     a = float(cfg["trunk"]["rff_sigma_start"])
     b = float(cfg["trunk"]["rff_sigma_end"])
-    return a + (b - a) * min(step / max(total, 1), 1.0)
+    frac = float(cfg["trunk"].get("rff_sigma_ramp_frac", 0.25))
+    ramp = max(int(total * frac), 1)
+    return a + (b - a) * min(step / ramp, 1.0)
+
+
+def _make_lr_lambda(total: int, warmup: int, lr_peak: float, lr_min: float):
+    """Linear warmup (0 -> peak) then cosine decay (peak -> lr_min).
+
+    Warmup tames the huge early PDE-residual gradients (the pde 6000% spike at step 0);
+    standard PINN practice (Wang et al., JMLR 2024). Returns a multiplicative factor on lr_peak.
+    """
+    min_factor = lr_min / lr_peak
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup:
+            return (step + 1) / max(warmup, 1)
+        progress = (step - warmup) / max(total - warmup, 1)
+        cos = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        return min_factor + (1.0 - min_factor) * cos
+
+    return lr_lambda
 
 
 def compute_losses(model, batch: Batch, device, sigma_factor: float) -> dict:
@@ -112,8 +138,11 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
     lam = cfg["loss"]
     sf = float(cfg["physics"]["sigma_factor"])
 
-    opt = torch.optim.Adam(model.parameters(), lr=float(tr["lr"]))
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total, eta_min=float(tr["lr_min"]))
+    lr_peak = float(tr["lr"])
+    warmup = int(tr.get("warmup_steps", 2000))
+    opt = torch.optim.Adam(model.parameters(), lr=lr_peak)
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, _make_lr_lambda(total, warmup, lr_peak, float(tr["lr_min"])))
     clip = float(tr["grad_clip_norm"])
 
     import numpy as np

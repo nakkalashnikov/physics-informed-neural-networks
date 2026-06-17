@@ -29,7 +29,8 @@ branch:
 trunk:
   rff_num_features: 64          # -> 128 after sin/cos
   rff_sigma_start: 1.0
-  rff_sigma_end: 3.5
+  rff_sigma_end: 3.0            # overfit diagnosis: 3.0 stable, 3.5 caused residual blow-ups
+  rff_sigma_ramp_frac: 0.25    # reach sigma_end at 25% of run, then HOLD (was full-length ramp)
   n_pirate_blocks: 3
   width: 256
   out_dim: 128          # p
@@ -49,8 +50,9 @@ batch:
 
 training:
   optimizer: adam
-  lr: 1.0e-3
+  lr: 3.0e-4              # overfit diagnosis: 3e-4 stable, 1e-3 caused residual blow-ups
   lr_min: 1.0e-5
+  warmup_steps: 2000     # linear LR warmup 0->lr — tames the huge early PDE-residual gradients
   total_steps: 200000
   grad_clip_norm: 1.0
   use_amp: false        # incompatible with sharp source (1D notes)
