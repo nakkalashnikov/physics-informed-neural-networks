@@ -20,6 +20,10 @@ def main() -> None:
     ap.add_argument("--profile", action="store_true", help="print per-stage ms/step breakdown (get/fwd/bwd)")
     ap.add_argument("--n-traj", type=int, default=None, help="override batch.n_traj_per_batch")
     ap.add_argument("--n-int", type=int, default=None, help="override batch.n_interior")
+    ap.add_argument("--validate-every", type=int, default=0,
+                    help="run L2 validation every N steps (0=disabled)")
+    ap.add_argument("--val-n", type=int, default=16,
+                    help="number of cases for mid-training validation (default 16)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -30,7 +34,8 @@ def main() -> None:
     train(cfg, device, total_steps=args.steps,
           use_prefetch=False if args.no_prefetch else None,
           checkpoint_path=args.out, cache_path=args.cache, profile=args.profile,
-          n_traj=args.n_traj, n_int=args.n_int)
+          n_traj=args.n_traj, n_int=args.n_int,
+          validate_every=args.validate_every, val_n=args.val_n)
 
 
 if __name__ == "__main__":

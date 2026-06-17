@@ -18,6 +18,7 @@ import torch
 from data import Batch, BatchPrefetcher, CachedBatcher, SourcePrefetcher, build_batch
 from model import build_model
 from physics import bc_flux_residual, bc_insulation_residual, pde_residual
+from validation.report import pi_table_sweep
 
 
 def select_device(name: str | None) -> torch.device:
@@ -92,7 +93,8 @@ def compute_losses(model, batch: Batch, device, sigma_factor: float) -> dict:
 def train(cfg: dict, device: torch.device, total_steps: int | None = None,
           use_prefetch: bool | None = None, log_every: int = 50,
           checkpoint_path: str = "checkpoint.pt", cache_path: str | None = None,
-          profile: bool = False, n_traj: int | None = None, n_int: int | None = None) -> str:
+          profile: bool = False, n_traj: int | None = None, n_int: int | None = None,
+          validate_every: int = 0, val_n: int = 16) -> str:
     tr = cfg["training"]
     total = int(total_steps if total_steps is not None else tr["total_steps"])
     seed = int(tr["seed"])
@@ -165,6 +167,16 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
         opt.step()
         sched.step()
         _sync(); _p3 = time.perf_counter()
+
+        if validate_every > 0 and step > 0 and (step % validate_every == 0 or step == total - 1):
+            model.eval()
+            with torch.no_grad():
+                sw = pi_table_sweep(model, cfg, device, n_cases=val_n)
+            model.train()
+            model.set_sigma(_sigma_at(step, total, cfg))
+            elapsed_h = (time.time() - t0) / 3600
+            print(f"  ── VAL step {step:6d} │ L2 median={sw['median']:.1%}  "
+                  f"p90={sw['p90']:.1%}  max={sw['max']:.1%}  │ {elapsed_h:.2f}h elapsed")
 
         if profile:
             prof["get"] += _p1 - _p0; prof["fwd"] += _p2 - _p1
