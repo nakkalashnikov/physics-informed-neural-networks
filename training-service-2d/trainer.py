@@ -91,7 +91,8 @@ def compute_losses(model, batch: Batch, device, sigma_factor: float) -> dict:
 
 def train(cfg: dict, device: torch.device, total_steps: int | None = None,
           use_prefetch: bool | None = None, log_every: int = 50,
-          checkpoint_path: str = "checkpoint.pt", cache_path: str | None = None) -> str:
+          checkpoint_path: str = "checkpoint.pt", cache_path: str | None = None,
+          profile: bool = False) -> str:
     tr = cfg["training"]
     total = int(total_steps if total_steps is not None else tr["total_steps"])
     seed = int(tr["seed"])
@@ -120,15 +121,25 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
         source = pf
         rng = None if prefetch else np.random.default_rng(seed)
 
+    def _sync():
+        if profile and device.type == "cuda":
+            torch.cuda.synchronize()
+
+    prof = {"get": 0.0, "fwd": 0.0, "bwd": 0.0, "n": 0}
+
     t0 = time.time()
     for step in range(total):
         model.set_sigma(_sigma_at(step, total, cfg))
+
+        _sync(); _p0 = time.perf_counter()
         batch = source.get() if source is not None else build_batch(cfg, rng)
+        _sync(); _p1 = time.perf_counter()
 
         loss_parts = compute_losses(model, batch, device, sf)
         loss = (float(lam["lambda_data"]) * loss_parts["data"]
                 + float(lam["lambda_pde"]) * loss_parts["pde"]
                 + float(lam["lambda_bc"]) * loss_parts["bc"])
+        _sync(); _p2 = time.perf_counter()
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -144,6 +155,11 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         opt.step()
         sched.step()
+        _sync(); _p3 = time.perf_counter()
+
+        if profile:
+            prof["get"] += _p1 - _p0; prof["fwd"] += _p2 - _p1
+            prof["bwd"] += _p3 - _p2; prof["n"] += 1
 
         if step % log_every == 0 or step == total - 1:
             rate = (step + 1) / (time.time() - t0)
@@ -156,6 +172,15 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
             print(f"step {step:6d} | "
                   f"data {data_pct:5.1f}% | pde {pde_pct:5.1f}% | bc {bc_pct:5.1f}% | "
                   f"loss {loss.item():.3e} | lr {sched.get_last_lr()[0]:.1e} | {rate:.1f} it/s")
+
+            if profile and prof["n"] > 0:
+                n = prof["n"]
+                g, f, b = prof["get"] / n * 1e3, prof["fwd"] / n * 1e3, prof["bwd"] / n * 1e3
+                tot = g + f + b
+                print(f"           profile (ms/step): get {g:5.1f} ({g/tot:4.0%})  "
+                      f"fwd+resid {f:5.1f} ({f/tot:4.0%})  bwd+step {b:5.1f} ({b/tot:4.0%})  "
+                      f"| total {tot:5.1f}")
+                prof.update(get=0.0, fwd=0.0, bwd=0.0, n=0)
 
     if pf:
         pf.close()

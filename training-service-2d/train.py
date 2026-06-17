@@ -17,6 +17,7 @@ def main() -> None:
     ap.add_argument("--out", default="checkpoint.pt")
     ap.add_argument("--no-prefetch", action="store_true")
     ap.add_argument("--cache", default=None, help="path to precomputed labels.npz (skips online Fourier)")
+    ap.add_argument("--profile", action="store_true", help="print per-stage ms/step breakdown (get/fwd/bwd)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -26,7 +27,7 @@ def main() -> None:
     print(f"device: {device}")
     train(cfg, device, total_steps=args.steps,
           use_prefetch=False if args.no_prefetch else None,
-          checkpoint_path=args.out, cache_path=args.cache)
+          checkpoint_path=args.out, cache_path=args.cache, profile=args.profile)
 
 
 if __name__ == "__main__":
