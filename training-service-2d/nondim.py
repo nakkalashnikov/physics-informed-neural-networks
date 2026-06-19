@@ -66,13 +66,20 @@ def sample_pi_groups(cfg: dict, rng: np.random.Generator) -> PiGroups:
 
 
 def normalize(pi: PiGroups, cfg: dict) -> tuple[float, float, float]:
-    """Map pi-groups to [0,1]^3 for the branch network (Fo in log space)."""
+    """Map pi-groups to [0,1]^3 for the branch network (Fo in log space).
+
+    A PINNED group (min==max, used by the linear-operator config) has zero range; map it to 0.5
+    instead of dividing by zero — the branch just sees a constant for that dimension.
+    """
     p = cfg["physics"]
-    log_fo_n = (math.log(pi.Fo) - math.log(p["Fo_min"])) / (
-        math.log(p["Fo_max"]) - math.log(p["Fo_min"])
-    )
-    ar_n = (pi.AR - p["AR_min"]) / (p["AR_max"] - p["AR_min"])
-    w_n = (pi.w - p["w_min"]) / (p["w_max"] - p["w_min"])
+
+    def _n(val: float, lo: float, hi: float) -> float:
+        span = hi - lo
+        return 0.5 if span == 0.0 else (val - lo) / span
+
+    log_fo_n = _n(math.log(pi.Fo), math.log(p["Fo_min"]), math.log(p["Fo_max"]))
+    ar_n = _n(pi.AR, p["AR_min"], p["AR_max"])
+    w_n = _n(pi.w, p["w_min"], p["w_max"])
     return (log_fo_n, ar_n, w_n)
 
 
