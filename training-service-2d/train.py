@@ -41,6 +41,9 @@ def main() -> None:
                     help="override trunk.rff_sigma_start")
     ap.add_argument("--sigma-bands", type=str, default=None,
                     help='override trunk.rff_sigma_bands, e.g. "[2,6,12]"')
+    ap.add_argument("--linear", action="store_true",
+                    help="restrict trajectories to straight-line constant-velocity "
+                         "(MUST match the cache; also makes validation sample linear cases)")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -62,6 +65,8 @@ def main() -> None:
         cfg["trunk"]["rff_sigma_start"] = args.sigma_start
     if args.sigma_bands is not None:
         cfg["trunk"]["rff_sigma_bands"] = [float(b) for b in json.loads(args.sigma_bands)]
+    if args.linear:
+        cfg["trajectory"]["linear"] = True
 
     device = select_device(args.device)
     print(f"device: {device}")

@@ -27,10 +27,20 @@ def sample_trajectory(cfg: dict, rng: np.random.Generator) -> Callable[[np.ndarr
     position (clipping would break C1 continuity).
     """
     tc = cfg["trajectory"]
+    margin = float(tc["x_margin"])
+
+    if tc.get("linear", False):
+        # Restricted family: straight-line constant-velocity source. The trajectory FUNCTION
+        # space collapses to two numbers (x0, v=x1-x0), so the operator's generalisation problem
+        # becomes low-dimensional — vs the ~infinite-dim random-Fourier space that plateaued at
+        # ~76%. Draw start & end in the allowed band; |v|=|x1-x0| <= 1-2*margin << speed cap, so
+        # the line is in-bounds and speed-legal by construction (no clipping needed).
+        x0, x1 = rng.uniform(margin, 1.0 - margin, size=2)
+        return lambda t: x0 + (x1 - x0) * np.atleast_1d(np.asarray(t, dtype=float))
+
     J = int(tc["n_fourier_modes"])
     p = float(tc["spectrum_decay"])
     sigma0 = float(tc["sigma0"])
-    margin = float(tc["x_margin"])
     speed_max = float(tc["speed_max_star"])
 
     j = np.arange(1, J + 1)

@@ -67,10 +67,14 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=None, help="override cache.n_cases")
     ap.add_argument("--out", default=None, help="override cache.path")
     ap.add_argument("--workers", type=int, default=max(1, cpu_count() - 1))
+    ap.add_argument("--linear", action="store_true",
+                    help="restrict source to straight-line constant-velocity trajectories")
     args = ap.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+    if args.linear:
+        cfg["trajectory"]["linear"] = True
     n_total = int(args.n if args.n is not None else cfg["cache"]["n_cases"])
     out = args.out or cfg["cache"]["path"]
     workers = max(1, args.workers)
