@@ -27,12 +27,16 @@ branch:
   out_dim: 128          # p (latent width, must match trunk.out_dim)
 
 trunk:
-  rff_num_features: 64          # -> 128 after sin/cos
-  rff_sigma_start: 1.0
-  rff_sigma_end: 3.0            # overfit diagnosis: 3.0 stable, 3.5 caused residual blow-ups
-  rff_sigma_ramp_frac: 0.5     # reach sigma_end at 50% of run, then HOLD. The descent "tracks"
-                               # the sigma ramp (overfit), so keep it rising through the useful-LR
-                               # window; full-length ramp only hit high freq when cosine LR was dead.
+  rff_num_features: 64          # per band; 2*64 (cos/sin) x 3 bands = 384 trunk input features
+  # Multi-scale Fourier features. The field has TWO scales: smooth diffused bulk (low sigma) and a
+  # razor-thin source curvature near yhat=0 (high sigma). A single sigma fits one or the other but
+  # never both — 1-case sweep: sigma=3 -> data 12% / pde 48% (bulk ok, curvature missed);
+  # sigma=12 -> data 48% / pde 12% (curvature ok, bulk corrupted). All bands at once lets the trunk
+  # use low freq for the bulk and high freq for the peak (Wang et al. 2021).
+  rff_sigma_bands: [2.0, 6.0, 18.0]
+  rff_sigma_start: 1.0          # global multiplier on the whole comb; 1->1 = curriculum OFF (the
+  rff_sigma_end: 1.0            # bands already carry the scales). Set start<end to ramp the comb up.
+  rff_sigma_ramp_frac: 0.5
   n_pirate_blocks: 3
   width: 256
   out_dim: 128          # p
@@ -40,8 +44,16 @@ trunk:
 loss:
   lambda_data: 10.0
   lambda_pde: 1.0
-  lambda_bc: 10.0
+  lambda_bc: 10.0        # insulated edges (x*=0,1 ; yhat=1)
+  lambda_flux: 10.0      # moving-flux BC at yhat=0. The analytic labels (cosine basis) enforce
+                         # u_y(0)=0, this term demands u_y(0)=-Q*ghat — inconsistent at the hot
+                         # boundary (check_consistency.py). Set 0 to test if that drives the plateau.
   lambda_ic: 0.0        # hard-enforced, no term
+  # BRDR robust residual: cap each collocation point's squared relative residual at
+  # gamma * median(r^2). Diagnostic dead-end (gamma=100 -> physics off at peak -> overfit;
+  # gamma=1000 -> ~no-op): the plateau was representational, not gradient-domination, so this
+  # is OFF by default. Kept as a tool (--residual-clip-gamma). See Jiang et al. 2025.
+  residual_clip_gamma: 0.0
 
 batch:
   n_traj_per_batch: 16

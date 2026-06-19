@@ -34,6 +34,40 @@ class FourierFeatures(nn.Module):
         return torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)
 
 
+class MultiScaleFourierFeatures(nn.Module):
+    """Random Fourier features at SEVERAL bandwidths at once.
+
+    The solution field has two scales: a smooth diffused bulk (low frequency) and a razor-thin
+    source-curvature near yhat=0 (high frequency). A single sigma fits one or the other but never
+    both — demonstrated by the 1-case sigma sweep: sigma=3 -> data 12% / pde 48% (bulk fit, curvature
+    missed); sigma=12 -> data 48% / pde 12% (curvature fit, bulk corrupted). Concatenating bands
+    gives the trunk every scale simultaneously, so it uses low freq for the bulk and high freq for
+    the peak (Wang/Wang/Perdikaris 2021, eigenvector bias of Fourier-feature networks).
+
+    Each band j has its own random projection B_j and absolute bandwidth band_scales[j]. A global
+    multiplier (set_sigma) scales every band together so an optional curriculum can still ramp the
+    whole comb; multiplier=1 keeps the bands at their configured values.
+    """
+
+    def __init__(self, d_in: int, m: int, bands: list[float]):
+        super().__init__()
+        self.n_bands = len(bands)
+        self.register_buffer("B", torch.randn(self.n_bands, m, d_in))
+        self.register_buffer("band_scales", torch.tensor([float(b) for b in bands]))
+        self.register_buffer("sigma_mult", torch.tensor(1.0))
+        self.out_dim = 2 * m * self.n_bands
+
+    def set_sigma(self, sigma: float) -> None:
+        self.sigma_mult.fill_(float(sigma))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # per-band projection scale[j]*(x @ B_j^T): x(N,d) , B(n_bands,m,d) -> (N,n_bands,m)
+        proj = torch.einsum("nd,bmd->nbm", x, self.B)
+        scales = (self.sigma_mult * self.band_scales).view(1, self.n_bands, 1)
+        proj = (2.0 * math.pi * scales * proj).reshape(x.shape[0], -1)   # (N, n_bands*m)
+        return torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)
+
+
 class PirateBlock(nn.Module):
     """Full PirateNet residual block with shared U/V gating and learnable scalar skip (init 0)."""
 
@@ -82,9 +116,9 @@ class BranchNet(nn.Module):
 class TrunkNet(nn.Module):
     """RFF + PirateNet trunk encoding (x*, y_hat, t*) -> latent tau in R^p."""
 
-    def __init__(self, rff_m: int, sigma_start: float, n_blocks: int, width: int, out_dim: int):
+    def __init__(self, rff_m: int, bands: list[float], n_blocks: int, width: int, out_dim: int):
         super().__init__()
-        self.fourier = FourierFeatures(d_in=3, m=rff_m, sigma=sigma_start)
+        self.fourier = MultiScaleFourierFeatures(d_in=3, m=rff_m, bands=bands)
         d_in = self.fourier.out_dim
         self.encoder_u = nn.Linear(d_in, width)
         self.encoder_v = nn.Linear(d_in, width)
@@ -119,7 +153,8 @@ class DeepONet(nn.Module):
         self.branch = BranchNet(in_dim=k + 3, hidden=list(cfg["branch"]["hidden"]), out_dim=p)
         self.trunk = TrunkNet(
             rff_m=int(cfg["trunk"]["rff_num_features"]),
-            sigma_start=float(cfg["trunk"]["rff_sigma_start"]),
+            bands=[float(b) for b in cfg["trunk"].get(
+                "rff_sigma_bands", [float(cfg["trunk"]["rff_sigma_end"])])],
             n_blocks=int(cfg["trunk"]["n_pirate_blocks"]),
             width=int(cfg["trunk"]["width"]),
             out_dim=p,

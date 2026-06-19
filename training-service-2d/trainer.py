@@ -70,7 +70,27 @@ def _make_lr_lambda(total: int, warmup: int, lr_peak: float, lr_min: float):
     return lr_lambda
 
 
-def compute_losses(model, batch: Batch, device, sigma_factor: float) -> dict:
+def _clipped_mse(r2: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Mean squared relative residual with each point capped at gamma * median(r^2).
+
+    A handful of points landing on the razor-thin moving source have second
+    derivatives (hence residuals) orders of magnitude above the rest; their squared
+    term then dominates the mean and steers the whole gradient. grad-norm clipping
+    only shortens that gradient vector — it does NOT fix its direction, so the
+    descent still chases the spike. Capping each point at gamma * median bounds any
+    single point's contribution (and zeroes its gradient when clipped), so the bulk
+    of the field can keep descending. BRDR-style robust residual (Jiang et al. 2025).
+    The cap is detached (a threshold, not part of the graph). gamma <= 0 -> plain
+    MSE = exact previous behavior, for clean A/B.
+    """
+    if gamma and gamma > 0.0:
+        cap = gamma * r2.detach().median()
+        r2 = torch.minimum(r2, cap)
+    return r2.mean()
+
+
+def compute_losses(model, batch: Batch, device, sigma_factor: float,
+                   clip_gamma: float = 0.0) -> dict:
     """Return dict of the three relative loss components (+ total)."""
     # --- data loss ---
     db = _t(batch.data_branch, device)
@@ -87,7 +107,7 @@ def compute_losses(model, batch: Batch, device, sigma_factor: float) -> dict:
     AR = _t(batch.int_AR, device)
     isc = _t(batch.int_scale, device)
     R = pde_residual(model, ib, ic, Fo, AR)
-    L_pde = ((R / isc) ** 2).mean()
+    L_pde = _clipped_mse((R / isc) ** 2, clip_gamma)
 
     # --- flux BC at yhat=0 ---
     bb = _t(batch.bc0_branch, device)
@@ -97,23 +117,26 @@ def compute_losses(model, batch: Batch, device, sigma_factor: float) -> dict:
     w = _t(batch.bc0_w, device)
     bfs = _t(batch.bc0_fluxscale, device)
     R_bc0 = bc_flux_residual(model, bb, bc, Q, xb, w, sigma_factor)
-    L_bc0 = ((R_bc0 / bfs) ** 2).mean()
+    L_bc0 = _clipped_mse((R_bc0 / bfs) ** 2, clip_gamma)
 
     # --- insulated edges ---
     xb_ = _t(batch.insx_branch, device)
     xc_ = _t(batch.insx_coords, device, grad=True)
     xsc = _t(batch.insx_scale, device)
     R_insx = bc_insulation_residual(model, xb_, xc_, axis=0)
-    L_insx = ((R_insx / xsc) ** 2).mean()
+    L_insx = _clipped_mse((R_insx / xsc) ** 2, clip_gamma)
 
     yb_ = _t(batch.insy_branch, device)
     yc_ = _t(batch.insy_coords, device, grad=True)
     ysc = _t(batch.insy_scale, device)
     R_insy = bc_insulation_residual(model, yb_, yc_, axis=1)
-    L_insy = ((R_insy / ysc) ** 2).mean()
+    L_insy = _clipped_mse((R_insy / ysc) ** 2, clip_gamma)
 
-    L_bc = L_bc0 + L_insx + L_insy
-    return {"data": L_data, "pde": L_pde, "bc": L_bc}
+    # flux BC (yhat=0) and insulation (other edges) returned SEPARATELY: the analytic labels
+    # come from a cosine basis (insulated wall + delta source, u_y(0)=0) while this flux term
+    # demands u_y(0)=-Q*ghat — inconsistent at the hot boundary (see check_consistency.py).
+    # lambda_flux=0 drops the flux term to test whether that conflict drives the plateau.
+    return {"data": L_data, "pde": L_pde, "flux": L_bc0, "ins": L_insx + L_insy}
 
 
 def train(cfg: dict, device: torch.device, total_steps: int | None = None,
@@ -137,6 +160,12 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
     model = build_model(cfg).to(device)
     lam = cfg["loss"]
     sf = float(cfg["physics"]["sigma_factor"])
+    clip_gamma = float(lam.get("residual_clip_gamma", 0.0))
+    lam_flux = float(lam.get("lambda_flux", lam["lambda_bc"]))   # flux BC at yhat=0 (own weight)
+    if clip_gamma > 0:
+        print(f"residual clip: gamma={clip_gamma:g} (per-point cap at gamma*median)")
+    print(f"loss weights: data={lam['lambda_data']:g} pde={lam['lambda_pde']:g} "
+          f"flux={lam_flux:g} ins(bc)={lam['lambda_bc']:g}")
 
     lr_peak = float(tr["lr"])
     warmup = int(tr.get("warmup_steps", 2000))
@@ -175,10 +204,11 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
         batch = source.get() if source is not None else build_batch(cfg, rng)
         _sync(); _p1 = time.perf_counter()
 
-        loss_parts = compute_losses(model, batch, device, sf)
+        loss_parts = compute_losses(model, batch, device, sf, clip_gamma)
         loss = (float(lam["lambda_data"]) * loss_parts["data"]
                 + float(lam["lambda_pde"]) * loss_parts["pde"]
-                + float(lam["lambda_bc"]) * loss_parts["bc"])
+                + lam_flux * loss_parts["flux"]
+                + float(lam["lambda_bc"]) * loss_parts["ins"])
         _sync(); _p2 = time.perf_counter()
 
         opt.zero_grad(set_to_none=True)
@@ -222,9 +252,10 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
             # (e.g. data 69% means the predicted field is ~69% off on average).
             data_pct = 100.0 * loss_parts["data"].item() ** 0.5
             pde_pct  = 100.0 * loss_parts["pde"].item() ** 0.5
-            bc_pct   = 100.0 * loss_parts["bc"].item() ** 0.5
+            flux_pct = 100.0 * loss_parts["flux"].item() ** 0.5
+            ins_pct  = 100.0 * loss_parts["ins"].item() ** 0.5
             print(f"step {step:6d} {prog:3.0f}% │ σ {sigma:.2f} │ "
-                  f"data {data_pct:5.1f}%  pde {pde_pct:6.1f}%  bc {bc_pct:5.1f}% │ "
+                  f"data {data_pct:5.1f}%  pde {pde_pct:6.1f}%  flux {flux_pct:6.1f}%  ins {ins_pct:5.1f}% │ "
                   f"lr {sched.get_last_lr()[0]:.1e} │ {rate:.1f} it/s │ ETA {eta_h:4.1f}h")
 
             if profile and prof["n"] > 0:
