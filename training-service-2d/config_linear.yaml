@@ -26,8 +26,8 @@ trajectory:
   speed_max_star: 4.0
 
 branch:
-  hidden: [256, 256, 256]
-  out_dim: 128
+  hidden: [512, 512, 512, 512]   # WIDER+DEEPER: encoding (x0,v)->field is the 2D-operator bottleneck
+  out_dim: 128                    # (data plateaued ~52% at [256,256,256]; branch was the limiter)
 
 trunk:
   rff_num_features: 64
@@ -48,7 +48,7 @@ loss:
   residual_clip_gamma: 0.0
 
 batch:
-  n_traj_per_batch: 8
+  n_traj_per_batch: 32   # 4x bigger batch: fills the 3090 (util up), steadier gradient, 4x visits/case
   n_interior: 1024
   n_bc0: 256
   n_bc_ins: 256
@@ -78,7 +78,7 @@ analytic:
   quad_nt: 2000
 
 cache:
-  n_cases: 256
+  n_cases: 512          # denser 2D (x0,v) coverage so the wider branch generalises (won't overfit)
   n_data_per_case: 512
   label_M: 48
   label_N: 32

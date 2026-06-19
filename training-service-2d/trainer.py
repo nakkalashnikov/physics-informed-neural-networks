@@ -162,6 +162,7 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
     sf = float(cfg["physics"]["sigma_factor"])
     clip_gamma = float(lam.get("residual_clip_gamma", 0.0))
     lam_flux = float(lam.get("lambda_flux", lam["lambda_bc"]))   # flux BC at yhat=0 (own weight)
+    ckpt_every = int(tr.get("checkpoint_every", 0))              # periodic save (0 = only at end)
     if clip_gamma > 0:
         print(f"residual clip: gamma={clip_gamma:g} (per-point cap at gamma*median)")
     print(f"loss weights: data={lam['lambda_data']:g} pde={lam['lambda_pde']:g} "
@@ -227,6 +228,9 @@ def train(cfg: dict, device: torch.device, total_steps: int | None = None,
         opt.step()
         sched.step()
         _sync(); _p3 = time.perf_counter()
+
+        if ckpt_every > 0 and step > 0 and step % ckpt_every == 0:   # survive Ctrl+C on long runs
+            torch.save({"model": model.state_dict(), "cfg": cfg, "step": step}, checkpoint_path)
 
         if validate_every > 0 and step > 0 and (step % validate_every == 0 or step == total - 1):
             model.eval()
