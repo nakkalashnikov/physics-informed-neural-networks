@@ -33,7 +33,8 @@ trunk:
   # never both — 1-case sweep: sigma=3 -> data 12% / pde 48% (bulk ok, curvature missed);
   # sigma=12 -> data 48% / pde 12% (curvature ok, bulk corrupted). All bands at once lets the trunk
   # use low freq for the bulk and high freq for the peak (Wang et al. 2021).
-  rff_sigma_bands: [2.0, 6.0, 18.0]
+  rff_sigma_bands: [2.0, 6.0, 12.0]   # 1-case band sweep: best data/pde balance (23%/25%);
+                                      # [2,6,18]=30/13 (curvature-heavy), [1,4,12]=18/67 (value-heavy)
   rff_sigma_start: 1.0          # global multiplier on the whole comb; 1->1 = curriculum OFF (the
   rff_sigma_end: 1.0            # bands already carry the scales). Set start<end to ramp the comb up.
   rff_sigma_ramp_frac: 0.5

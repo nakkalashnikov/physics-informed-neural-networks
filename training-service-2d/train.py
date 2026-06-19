@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 import yaml
 
@@ -38,6 +39,8 @@ def main() -> None:
                     help="override trunk.rff_sigma_end (trunk RFF bandwidth — sharpness ceiling)")
     ap.add_argument("--sigma-start", type=float, default=None,
                     help="override trunk.rff_sigma_start")
+    ap.add_argument("--sigma-bands", type=str, default=None,
+                    help='override trunk.rff_sigma_bands, e.g. "[2,6,12]"')
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -57,6 +60,8 @@ def main() -> None:
         cfg["trunk"]["rff_sigma_end"] = args.sigma_end
     if args.sigma_start is not None:
         cfg["trunk"]["rff_sigma_start"] = args.sigma_start
+    if args.sigma_bands is not None:
+        cfg["trunk"]["rff_sigma_bands"] = [float(b) for b in json.loads(args.sigma_bands)]
 
     device = select_device(args.device)
     print(f"device: {device}")
