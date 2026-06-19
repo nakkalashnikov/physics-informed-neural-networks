@@ -24,7 +24,7 @@ ui/.env.local
 
 # training-service-2d artifacts
 training-service-2d/*.npz
-training-service-2d/*.pt
+training-service-2d/**/*.pt
 training-service-2d/*.log
 training-service-2d/**/__pycache__/
 
