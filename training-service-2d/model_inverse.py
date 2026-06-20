@@ -7,6 +7,8 @@ known normalized material/geometry; the trunk encodes the query time. Smooth low
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -27,6 +29,24 @@ def _mlp(d_in: int, hidden: list[int], d_out: int) -> nn.Sequential:
     return nn.Sequential(*layers)
 
 
+class _TrunkT(nn.Module):
+    """t -> R^p with Fourier features so the trunk can represent a wiggly xb(t).
+
+    n_freq=0 -> just [t] (affine-capable, enough for linear trajectories); n_freq>0 adds
+    sin/cos(kπt) up to n_freq, letting xb(t) carry up to ~n_freq oscillations (arbitrary paths).
+    """
+
+    def __init__(self, n_freq: int, hidden: list[int], p: int):
+        super().__init__()
+        self.register_buffer("freqs", math.pi * torch.arange(1, n_freq + 1, dtype=torch.float32))
+        self.net = _mlp(1 + 2 * n_freq, hidden, p)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        ang = t * self.freqs                                  # (T, n_freq)
+        feats = torch.cat([t, torch.sin(ang), torch.cos(ang)], dim=-1)
+        return self.net(feats)
+
+
 class InverseDeepONet(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
@@ -34,7 +54,7 @@ class InverseDeepONet(nn.Module):
         self.K, self.M = int(iv["n_sensors"]), int(iv["n_times"])
         p = int(iv["latent"])
         self.branch = _mlp(self.K * self.M + 3, list(iv["branch_hidden"]), p)
-        self.trunk = _mlp(1, list(iv["trunk_hidden"]), p)
+        self.trunk = _TrunkT(int(iv.get("trunk_n_freq", 0)), list(iv["trunk_hidden"]), p)
         self.bias = nn.Parameter(torch.zeros(1))
 
     def forward(self, branch_in: torch.Tensor, t: torch.Tensor) -> torch.Tensor:

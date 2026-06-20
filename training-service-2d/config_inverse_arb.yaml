@@ -1,0 +1,55 @@
+# Inverse PI-DeepONet, ARBITRARY-trajectory variant: the source moves along any smooth continuous
+# path xb(t); the inverse recovers the trajectory from sensors. Harder & ill-posed — diffusion is
+# low-pass, so high-frequency wiggles are physically erased before reaching the sensors. The net
+# recovers the SMOOTH (conditional-mean) trajectory; the residual error is the unrecoverable high freq.
+
+physics:
+  Fo_min: 3.0e-4
+  Fo_max: 3.0e-2
+  AR_min: 0.05
+  AR_max: 0.30
+  w_min: 0.04
+  w_max: 0.20
+  sigma_factor: 6.0
+
+trajectory:
+  arbitrary: true          # random smooth Fourier trajectories (not just straight lines)
+  k_sensors: 101           # (unused here; sample_trajectory reads it)
+  n_fourier_modes: 5       # J: trajectory complexity (modes)
+  spectrum_decay: 2.0
+  sigma0: 1.0
+  x_margin: 0.05
+  speed_max_star: 4.0
+
+inverse:
+  n_sensors: 12            # a few more sensors — arbitrary paths need more coverage
+  sensor_x_lo: 0.10
+  sensor_x_hi: 0.90
+  sensor_y: 0.15
+  n_times: 40              # M time samples per sensor
+  latent: 96              # p
+  branch_hidden: [512, 512, 512]
+  trunk_hidden: [128, 128]
+  trunk_n_freq: 8          # Fourier features on t so xb(t) can wiggle
+  n_query: 21             # supervision grid over the trajectory
+
+training:
+  lr: 1.0e-3
+  lr_min: 1.0e-5
+  steps: 20000
+  batch: 256
+  weight_decay: 0.0
+  seed: 0
+  log_every: 200
+  val_every: 1000
+
+data:
+  n_train: 12000
+  n_val: 1500
+  cache: inverse_arb.npz
+
+analytic:
+  fourier_M: 48
+  fourier_N: 32
+  quad_nx: 300
+  quad_nt: 300

@@ -29,7 +29,8 @@ def _device(name: str | None) -> torch.device:
 def _load(cfg: dict, split: str):
     d = np.load(cfg["data"]["cache"].replace(".npz", f"_{split}.npz"))
     X = np.concatenate([d["meas"], d["mat"]], axis=1).astype(np.float32)   # [measurements ; material]
-    return torch.as_tensor(X), torch.as_tensor(d["tgt"], dtype=torch.float32)   # X, (x0,v)
+    return (torch.as_tensor(X), torch.as_tensor(d["traj_q"], dtype=torch.float32),   # X, xb(t_q) target
+            torch.as_tensor(d["t_q"], dtype=torch.float32).reshape(-1, 1))           # query grid
 
 
 def main() -> None:
@@ -43,46 +44,44 @@ def main() -> None:
     dev = _device(args.device)
     print("device:", dev)
 
-    Xtr, Ytr = _load(cfg, "train"); Xtr, Ytr = Xtr.to(dev), Ytr.to(dev)
-    Xva, Yva = _load(cfg, "val");   Xva, Yva = Xva.to(dev), Yva.to(dev)
-    print(f"train {Xtr.shape[0]} | val {Xva.shape[0]} | branch_in {Xtr.shape[1]}")
+    Xtr, Ttr, t_q = _load(cfg, "train"); Xtr, Ttr, t_q = Xtr.to(dev), Ttr.to(dev), t_q.to(dev)
+    Xva, Tva, _ = _load(cfg, "val");     Xva, Tva = Xva.to(dev), Tva.to(dev)
+    arbitrary = bool(cfg["trajectory"].get("arbitrary", False))
+    print(f"train {Xtr.shape[0]} | val {Xva.shape[0]} | branch_in {Xtr.shape[1]} | "
+          f"Q={t_q.shape[0]} | {'arbitrary' if arbitrary else 'linear'} trajectories")
 
     model = build_inverse_model(cfg).to(dev)
     tr = cfg["training"]
     total = int(args.steps or tr["steps"]); bs = int(tr["batch"])
-    Q = int(cfg["inverse"]["n_query"])
-    t_q = torch.linspace(0, 1, Q, device=dev).reshape(-1, 1)
     opt = torch.optim.Adam(model.parameters(), lr=float(tr["lr"]),
                            weight_decay=float(tr["weight_decay"]))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, total, eta_min=float(tr["lr_min"]))
 
-    margin = float(cfg["trajectory"]["x_margin"])
-    rng_x = 1.0 - 2.0 * margin                 # x0 range; v range ~ 2*rng_x
+    margin = float(cfg["trajectory"]["x_margin"]); rng_x = 1.0 - 2.0 * margin
     N = Xtr.shape[0]
 
     def evaluate():
         model.eval()
         with torch.no_grad():
             xb_pred = model(Xva, t_q)                                   # (Nval, Q)
-            xb_true = Yva[:, 0:1] + Yva[:, 1:2] * t_q.squeeze(1)[None, :]
-            relL2 = (xb_pred - xb_true).pow(2).mean(1).sqrt() / (xb_true.pow(2).mean(1).sqrt() + 1e-9)
-            rec = model.recover(Xva)
-            x0e = (rec[:, 0] - Yva[:, 0]).abs() / rng_x
-            ve = (rec[:, 1] - Yva[:, 1]).abs() / (2 * rng_x)
+            relL2 = ((xb_pred - Tva).pow(2).mean(1).sqrt()
+                     / (Tva.pow(2).mean(1).sqrt() + 1e-9)).median().item()
+            # readout: x0 = xb(0), v = (xb(1)-xb(0)) — informative for the linear family
+            x0e = ((xb_pred[:, 0] - Tva[:, 0]).abs() / rng_x).median().item()
+            ve = (((xb_pred[:, -1] - xb_pred[:, 0]) - (Tva[:, -1] - Tva[:, 0])).abs()
+                  / (2 * rng_x)).median().item()
         model.train()
-        return relL2.median().item(), x0e.median().item(), ve.median().item()
+        return relL2, x0e, ve
 
     for step in range(total):
         idx = torch.randint(0, N, (bs,), device=dev)
-        xb_pred = model(Xtr[idx], t_q)                                  # (bs, Q)
-        xb_true = Ytr[idx, 0:1] + Ytr[idx, 1:2] * t_q.squeeze(1)[None, :]
-        loss = (xb_pred - xb_true).pow(2).mean()
+        loss = (model(Xtr[idx], t_q) - Ttr[idx]).pow(2).mean()
         opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); sched.step()
 
         if step % int(tr["val_every"]) == 0 or step == total - 1:
             rl2, x0e, ve = evaluate()
             print(f"step {step:6d} | loss {loss.item():.2e} | "
-                  f"traj relL2 {rl2:5.1%} │ x0 err {x0e:5.1%}  v err {ve:5.1%} │ "
+                  f"traj relL2 {rl2:5.1%} │ x0 err {x0e:5.1%}  v(end) err {ve:5.1%} │ "
                   f"lr {sched.get_last_lr()[0]:.1e}")
 
     torch.save({"model": model.state_dict(), "cfg": cfg}, args.out)
