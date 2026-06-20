@@ -1,0 +1,46 @@
+# Inverse PI-DeepONet: branch([thermocouples; Fo; AR; w]) ⊗ trunk(t) -> xb(t).
+# Recovers the source trajectory (for linear: x0, v) from sparse measurements + known material/geometry.
+
+physics:                  # material/geometry VARIED — the operator generalises over them
+  Fo_min: 3.0e-4
+  Fo_max: 3.0e-2
+  AR_min: 0.05
+  AR_max: 0.30
+  w_min: 0.04
+  w_max: 0.20
+  sigma_factor: 6.0
+
+trajectory:
+  x_margin: 0.05          # source start/end stay in [margin, 1-margin]
+
+inverse:
+  n_sensors: 9            # thermocouples, row along x near the bottom (x-spread > y-spread)
+  sensor_x_lo: 0.15
+  sensor_x_hi: 0.90
+  sensor_y: 0.15
+  n_times: 30             # M time samples per sensor over t*∈[0,1]
+  latent: 64             # p (branch out == trunk out)
+  branch_hidden: [512, 512, 256]
+  trunk_hidden: [64, 64]
+  n_query: 11            # trunk query times for the supervised xb(t) loss
+
+training:
+  lr: 1.0e-3
+  lr_min: 1.0e-5
+  steps: 20000
+  batch: 256
+  weight_decay: 0.0
+  seed: 0
+  log_every: 200
+  val_every: 1000
+
+data:
+  n_train: 8000
+  n_val: 1000
+  cache: inverse_data.npz
+
+analytic:                 # modes for label generation (modest — measurements don't need machine precision)
+  fourier_M: 48
+  fourier_N: 32
+  quad_nx: 300
+  quad_nt: 300
