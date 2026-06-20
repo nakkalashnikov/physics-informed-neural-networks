@@ -4,28 +4,22 @@ __pycache__/
 *.pyo
 .venv/
 
-# Checkpoints & training artefacts — generated, not source
-training-service/checkpoints/*.pt
-training-service/checkpoints/history.json
-training-service/*.log
-training-service/inspect_output.png
-
 # macOS
 .DS_Store
 
 # IDE tooling
 .codegraph/
 
-# Node / Next.js
-ui/node_modules/
-ui/.next/
-ui/.env.local
+# Node / Next.js (legacy 1D demo, now under experiments/legacy-1d/ui)
+experiments/legacy-1d/ui/node_modules/
+experiments/legacy-1d/ui/.next/
+experiments/legacy-1d/ui/.env.local
 
-
-# experiments/ (legacy junkyard — was training-service-2d)
-experiments/*.npz
+# experiments/ (legacy junkyard: 2D probes + legacy-1d/ stack)
+experiments/**/*.npz
 experiments/**/*.pt
-experiments/*.log
+experiments/**/*.log
+experiments/**/history.json
 experiments/**/__pycache__/
 
 # microservice training artefacts (generated, not source)
@@ -33,6 +27,7 @@ service-operator/checkpoints/
 service-pinn/checkpoints/
 **/*.npz
 **/*.pt
+**/*.log
 
 # editable-install metadata
 *.egg-info/
