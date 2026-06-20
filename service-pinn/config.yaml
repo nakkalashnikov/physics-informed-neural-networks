@@ -15,7 +15,7 @@ trunk:
   rff_sigma_bands: [2.0, 6.0, 12.0]   # multi-scale Fourier features
   rff_sigma_start: 0.3                # curriculum 0.3 -> 1.0 on the comb
   rff_sigma_end: 1.0
-  rff_sigma_ramp_frac: 0.5
+  rff_sigma_ramp_frac: 0.2                # σ→1.0 by step 16k → ~64k steps at full resolution
   n_pirate_blocks: 3
   width: 256
   out_dim: 1
@@ -37,7 +37,7 @@ training:
   lr: 1.0e-3
   lr_min: 1.0e-5
   warmup_steps: 2000
-  total_steps: 40000
+  total_steps: 80000           # 40k local hit 25% still descending; double it to land ≤23%
   grad_clip_norm: 1.0
   seed: 0
   validate_every: 2000
