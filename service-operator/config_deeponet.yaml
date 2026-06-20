@@ -1,0 +1,100 @@
+# PI-DeepONet forward operator — linear constant-velocity source, VARIED material/geometry.
+# One model generalises over (x0, v) AND (Fo, AR, w). Loss has the PDE in it -> genuine PINN.
+# Ablation: config_deeponet.yaml sets lambda_pde=0 (data-only DeepONet) for the "does physics help" test.
+
+physics:                  # material/geometry sampled per case (the operator generalises over them)
+  Fo_min: 3.0e-4
+  Fo_max: 3.0e-2
+  AR_min: 0.05
+  AR_max: 0.30
+  w_min: 0.04
+  w_max: 0.20
+  P_ref: 1.0
+  t_end_ref: 1.0
+  sigma_factor: 6.0
+
+trajectory:
+  linear: true            # straight constant-velocity source (x0 + v*t)
+  k_sensors: 101
+  n_fourier_modes: 5      # unused in linear mode
+  spectrum_decay: 2.0
+  sigma0: 1.0
+  x_margin: 0.05
+  speed_max_star: 4.0
+
+branch:
+  hidden: [512, 512, 512, 512]
+  out_dim: 128
+
+trunk:
+  rff_num_features: 64
+  rff_sigma_bands: [2.0, 6.0, 12.0]   # multi-scale Fourier features (bulk + sharp source)
+  rff_sigma_start: 0.3                # curriculum: ramp the comb 0.3->1.0 (smooth start)
+  rff_sigma_end: 1.0
+  rff_sigma_ramp_frac: 0.5
+  n_pirate_blocks: 3
+  width: 256
+  out_dim: 128
+
+loss:
+  lambda_data: 10.0
+  lambda_pde: 0.0          # ABLATION: data-only DeepONet (no physics in loss)
+  lambda_bc: 10.0
+  lambda_flux: 0.0         # flux BC inconsistent with cosine labels at yhat=0; source carried by data
+  lambda_ic: 0.0
+  residual_clip_gamma: 0.0
+
+batch:
+  n_traj_per_batch: 32
+  n_interior: 1024
+  n_bc0: 256
+  n_bc_ins: 256
+  n_data: 512
+  source_frac: 0.5
+  source_band_sigmas: 3.0
+
+training:
+  optimizer: adam
+  lr: 1.0e-3
+  lr_min: 1.0e-5
+  warmup_steps: 2000
+  total_steps: 40000
+  grad_clip_norm: 1.0
+  use_amp: false
+  use_compile: false
+  use_fp64: false
+  use_prefetch: true
+  seed: 0
+  checkpoint_every: 5000
+  validate_every: 5000
+
+analytic:
+  fourier_M: 64
+  fourier_N: 48
+  quad_nx: 400
+  quad_nt: 2000
+
+cache:
+  n_cases: 3000           # 5-D space (x0,v + Fo,AR,w) — more cases for coverage than the 2-D fixed-material run
+  n_data_per_case: 512
+  label_M: 48
+  label_N: 32
+  label_ntau: 400
+  path: checkpoints/labels.npz
+
+fdm:
+  nx: 201
+  ny: 101
+  nt: 400
+  r_target: 0.4
+
+validation:
+  pi_table_n_cases: 64
+  ensemble_size: 5
+  thresholds:
+    l2_green: 0.02
+    l2_yellow: 0.05
+    energy_green: 0.02
+    energy_yellow: 0.05
+    defect_green: 0.03
+    defect_yellow: 0.08

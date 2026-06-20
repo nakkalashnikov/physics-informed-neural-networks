@@ -1,0 +1,49 @@
+# Single-instance PINN — one fixed 2D moving-heat-source problem, solved with physics in the loss.
+
+instance:                 # the ONE problem this PINN solves
+  Fo: 3.0e-3              # Fourier number (material/time/length)
+  AR: 0.15               # aspect ratio h/l
+  w: 0.08               # contact width S/l
+  x0: 0.10               # source start
+  v: 0.80               # constant velocity (source goes 0.10 -> 0.90 over t*∈[0,1])
+
+physics:
+  sigma_factor: 6.0
+
+trunk:
+  rff_num_features: 64
+  rff_sigma_bands: [2.0, 6.0, 12.0]   # multi-scale Fourier features
+  rff_sigma_start: 0.3                # curriculum 0.3 -> 1.0 on the comb
+  rff_sigma_end: 1.0
+  rff_sigma_ramp_frac: 0.5
+  n_pirate_blocks: 3
+  width: 256
+  out_dim: 1
+
+loss:
+  lambda_data: 10.0       # sparse analytic anchors
+  lambda_pde: 1.0         # PDE residual IN the loss -> physics-informed
+  lambda_bc: 10.0         # insulation edges
+
+batch:
+  n_interior: 2048
+  n_bc_ins: 512
+  n_data: 1024
+  n_anchor: 4096          # precomputed analytic anchor pool (sampled each step)
+  source_frac: 0.5        # interior points concentrated near the moving source
+  source_band_sigmas: 3.0
+
+training:
+  lr: 1.0e-3
+  lr_min: 1.0e-5
+  warmup_steps: 2000
+  total_steps: 40000
+  grad_clip_norm: 1.0
+  seed: 0
+  validate_every: 2000
+
+analytic:
+  fourier_M: 48
+  fourier_N: 32
+  quad_nx: 300
+  quad_nt: 400

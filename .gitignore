@@ -22,11 +22,20 @@ ui/.next/
 ui/.env.local
 
 
-# training-service-2d artifacts
-training-service-2d/*.npz
-training-service-2d/**/*.pt
-training-service-2d/*.log
-training-service-2d/**/__pycache__/
+# experiments/ (legacy junkyard — was training-service-2d)
+experiments/*.npz
+experiments/**/*.pt
+experiments/*.log
+experiments/**/__pycache__/
+
+# microservice training artefacts (generated, not source)
+service-operator/checkpoints/
+service-pinn/checkpoints/
+**/*.npz
+**/*.pt
+
+# editable-install metadata
+*.egg-info/
 
 # Claude Code internals
 .claude/skills/
